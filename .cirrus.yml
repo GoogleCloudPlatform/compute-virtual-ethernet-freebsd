@@ -1,0 +1,22 @@
+env:
+  CIRRUS_CLONE_DEPTH: 1
+  ARCH: amd64
+
+task:
+  compute_engine_instance:
+    image_project: freebsd-org-cloud-dev
+    platform: freebsd
+  matrix:
+    - name: 14-CURRENT
+      compute_engine_instance:
+        image: family/freebsd-14-0-snap
+    - name: 13.1-STABLE
+      compute_engine_instance:
+        image: family/freebsd-13-1-snap
+    - name: 13.1-RELEASE
+      compute_engine_instance:
+        image: family/freebsd-13-1
+  script:
+    - make
+    - kldload ./gve.ko
+    - kldunload gve.ko
