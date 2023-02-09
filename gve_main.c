@@ -794,7 +794,5 @@ static driver_t gve_driver = {
 	sizeof(struct gve_priv)
 };
 
-static devclass_t gve_devclass;
-
-DRIVER_MODULE(gve, pci, gve_driver, gve_devclass, 0, 0);
+DRIVER_MODULE(gve, pci, gve_driver, 0, 0);
 MODULE_DEPEND(gve, linuxkpi, 1, 1, 1);
