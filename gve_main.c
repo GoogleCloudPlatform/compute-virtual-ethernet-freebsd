@@ -794,7 +794,12 @@ static driver_t gve_driver = {
 	sizeof(struct gve_priv)
 };
 
+#if __FreeBSD_version < 1301503
 static devclass_t gve_devclass;
 
 DRIVER_MODULE(gve, pci, gve_driver, gve_devclass, 0, 0);
+#else
+DRIVER_MODULE(gve, pci, gve_driver, 0, 0);
+#endif
+
 MODULE_DEPEND(gve, linuxkpi, 1, 1, 1);
