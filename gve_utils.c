@@ -63,19 +63,19 @@ gve_db_bar_write_4(struct gve_priv *priv, bus_size_t offset, uint32_t val)
 void
 gve_alloc_counters(counter_u64_t *stat, int num_stats)
 {
-	for(int i = 0; i < num_stats; i++) {
-		*stat = counter_u64_alloc(M_WAITOK);
-		stat++;
-	}
+	int i;
+
+	for (i = 0; i < num_stats; i++)
+		stat[i] = counter_u64_alloc(M_WAITOK);
 }
 
 void
 gve_free_counters(counter_u64_t *stat, int num_stats)
 {
-	for(int i = 0; i < num_stats; i++) {
-		counter_u64_free(*stat);
-		stat++;
-	}
+	int i;
+
+	for (i = 0; i < num_stats; i++)
+		counter_u64_free(stat[i]);
 }
 
 /* Currently assumes a single segment. */
@@ -83,9 +83,8 @@ static void
 gve_dmamap_load_callback(void *arg, bus_dma_segment_t *segs, int nseg,
     int error)
 {
-	if (error != 0)
-		return;
-	*(bus_addr_t *) arg = segs[0].ds_addr;
+	if (error == 0)
+		*(bus_addr_t *) arg = segs[0].ds_addr;
 }
 
 int
@@ -122,11 +121,12 @@ gve_dma_alloc_coherent(struct gve_priv *priv, int size, int align,
 		goto destroy_tag;
 	}
 
-	dma->bus_addr = IF_BAD_DMA;
+	/* An address set by the callback will never be -1 */
+	dma->bus_addr = (bus_addr_t)-1;
 	err = bus_dmamap_load(dma->tag, dma->map, dma->cpu_addr, size,
 			      gve_dmamap_load_callback, &dma->bus_addr,
 			      mapflags | BUS_DMA_NOWAIT);
-	if ((err != 0) || dma->bus_addr == IF_BAD_DMA) {
+	if ((err != 0) || dma->bus_addr == (bus_addr_t)-1) {
 		device_printf(dev, "%s: bus_dmamap_load failed: %d\n",
 			      __func__, err);
 		goto free_mem;
@@ -181,6 +181,9 @@ gve_free_irqs(struct gve_priv *priv)
 
 	for (i = 0; i < num_irqs; i++) {
 		irq = &priv->irq_tbl[i];
+		if (irq->res == NULL)
+		  continue;
+
 		rid = rman_get_rid(irq->res);
 
 		rc = bus_teardown_intr(priv->dev, irq->res, irq->cookie);
@@ -200,6 +203,8 @@ gve_free_irqs(struct gve_priv *priv)
 
 	free(priv->irq_tbl, M_GVE);
 	priv->irq_tbl = NULL;
+
+	/* Safe to call even if msix was never alloced */
 	pci_release_msi(priv->dev);
 }
 
@@ -211,28 +216,33 @@ gve_alloc_irqs(struct gve_priv *priv)
 	int req_nvecs = num_tx + num_rx + 1;
 	int got_nvecs = req_nvecs;
 	struct gve_irq *irq;
-	int rc, rcc;
 	int i, j, m;
 	int rid;
+	int err;
 
 	struct gve_ring_com *com;
 	struct gve_rx_ring *rx;
 	struct gve_tx_ring *tx;
 
 	if (pci_alloc_msix(priv->dev, &got_nvecs) != 0) {
-		device_printf(priv->dev, "Failed to acquire %d msix vectors, only obtained %d\n",
+		device_printf(priv->dev, "Failed to acquire any msix vectors\n");
+		err = ENXIO;
+		goto abort;
+	} else if (got_nvecs != req_nvecs) {
+		device_printf(priv->dev, "Tried to acquire %d msix vectors, got only %d\n",
 			      req_nvecs, got_nvecs);
-		rc = ENOSPC;
-		goto free_msix;
-	}
+		err = ENOSPC;
+		goto abort;
+        }
+
 	device_printf(priv->dev, "Enabled MSIX with %d vectors\n", got_nvecs);
 
 	priv->irq_tbl = malloc(sizeof(struct gve_irq) * req_nvecs, M_GVE,
 			       M_NOWAIT | M_ZERO);
 	if (priv->irq_tbl == NULL) {
 		device_printf(priv->dev, "Could not alloc irq table\n");
-		rc = ENOMEM;
-		goto free_msix;
+		err = ENOMEM;
+		goto abort;
 	}
 
 	for (i = 0; i < num_tx; i++) {
@@ -247,16 +257,16 @@ gve_alloc_irqs(struct gve_priv *priv)
 			device_printf(priv->dev,
 				      "Could not alloc irq %d for Tx queue %d\n",
 				      rid, i);
-			rc = ENOMEM;
-			goto free_tx_irqs;
+			err = ENOMEM;
+			goto abort;
 		}
 
-		rc = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
+		err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
 		         gve_tx_intr, NULL, &priv->tx[i], &irq->cookie);
-		if (rc != 0) {
+		if (err != 0) {
 			device_printf(priv->dev, "Could not setup irq %d for Tx queue %d, "
-			    "err: %d\n", rid, i, rc);
-			goto teardown_tx_irqs;
+			    "err: %d\n", rid, i, err);
+			goto abort;
 		}
 
 		bus_describe_intr(priv->dev, irq->res, irq->cookie, "tx%d", i);
@@ -274,16 +284,16 @@ gve_alloc_irqs(struct gve_priv *priv)
 		if (irq->res == NULL) {
 			device_printf(priv->dev,
 			    "Could not alloc irq %d for Rx queue %d", rid, j);
-			rc = ENOMEM;
-			goto free_rx_irqs;
+			err = ENOMEM;
+			goto abort;
 		}
 
-		rc = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
+		err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
 		         gve_rx_intr, NULL, &priv->rx[j], &irq->cookie);
-		if (rc != 0) {
+		if (err != 0) {
 			device_printf(priv->dev, "Could not setup irq %d for Rx queue %d, "
-			    "err: %d\n", rid, j, rc);
-			goto teardown_rx_irqs;
+			    "err: %d\n", rid, j, err);
+			goto abort;
 		}
 
 		bus_describe_intr(priv->dev, irq->res, irq->cookie, "rx%d", j);
@@ -298,99 +308,40 @@ gve_alloc_irqs(struct gve_priv *priv)
 		       &rid, RF_ACTIVE);
 	if (irq->res == NULL) {
 		device_printf(priv->dev, "Could not allocate irq %d for mgmnt queue\n", rid);
-		rc = ENOMEM;
-		goto free_rx_irqs;
+		err = ENOMEM;
+		goto abort;
 	}
 
-	rc = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
+	err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
 	         gve_mgmnt_intr, NULL, priv, &irq->cookie);
-	if (rc != 0) {
+	if (err != 0) {
 		device_printf(priv->dev, "Could not setup irq %d for mgmnt queue\n, err: %d",
-		    rid, rc);
-		goto free_mgmnt_irq;
+		    rid, err);
+		goto abort;
 	}
 
 	bus_describe_intr(priv->dev, irq->res, irq->cookie, "mgmnt");
 
 	return (0);
 
-free_mgmnt_irq:
-	irq = &priv->irq_tbl[m];
-	rid = m + 1;
-	rcc = bus_release_resource(priv->dev, SYS_RES_IRQ,
-	          rman_get_rid(irq->res), irq->res);
-	if (rcc != 0)
-		device_printf(priv->dev, "Could not release irq %d for mgmnt queue, err: %d\n",
-		    rid, rcc);
-teardown_rx_irqs:
-	while (j--) {
-		irq = &priv->irq_tbl[i + j];
-		rcc = bus_teardown_intr(priv->dev, irq->res, irq->cookie);
-		if (rcc != 0)
-			device_printf(priv->dev, "Could not teardown irq %d for Rx queue %d, "
-			    "err: %d\n", i + j, j, rcc);
-	}
-	j = num_rx;
-free_rx_irqs:
-	while (j--) {
-		irq = &priv->irq_tbl[i + j];
-		rid = i + j + 1;
-		rcc = bus_release_resource(priv->dev, SYS_RES_IRQ,
-		          rman_get_rid(irq->res), irq->res);
-		if (rcc != 0)
-			device_printf(priv->dev, "Could not release irq %d for Rx queue %d, "
-			    "err: %d\n", rid, j, rcc);
-	}
-teardown_tx_irqs:
-	while (i--) {
-		irq = &priv->irq_tbl[i];
-		rcc = bus_teardown_intr(priv->dev, irq->res, irq->cookie);
-		if (rcc != 0)
-			device_printf(priv->dev, "Could not teardown irq %d for Tx queue %d, "
-			    "err: %d\n", i, i, rcc);
-	}
-	i = num_tx;
-free_tx_irqs:
-	while (i--) {
-		irq = &priv->irq_tbl[i];
-		rid = i + 1;
-		rcc = bus_release_resource(priv->dev, SYS_RES_IRQ,
-		          rman_get_rid(irq->res), irq->res);
-		if (rcc != 0)
-			device_printf(priv->dev, "Could not release irq %d for Tx queue %d, "
-			    "err: %d\n", rid, i, rcc);
-
-	}
-	free(priv->irq_tbl, M_GVE);
-	priv->irq_tbl = NULL;
-free_msix:
-	pci_release_msi(priv->dev);
-
-	return (rc);
+abort:
+	gve_free_irqs(priv);
+	return (err);
 }
 
 void
 gve_unmask_all_queue_irqs(struct gve_priv *priv)
 {
-	for (int idx = 0; idx < priv->tx_cfg.num_queues; idx++) {
-		struct gve_tx_ring *tx = &priv->tx[idx];
+	struct gve_tx_ring *tx;
+	struct gve_rx_ring *rx;
+	int idx;
+
+	for (idx = 0; idx < priv->tx_cfg.num_queues; idx++) {
+		tx = &priv->tx[idx];
 		gve_db_bar_write_4(priv, tx->com.irq_db_offset, 0);
 	}
-	for (int idx = 0; idx < priv->rx_cfg.num_queues; idx++) {
-		struct gve_rx_ring *rx = &priv->rx[idx];
+	for (idx = 0; idx < priv->rx_cfg.num_queues; idx++) {
+		rx = &priv->rx[idx];
 		gve_db_bar_write_4(priv, rx->com.irq_db_offset, 0);
-	}
-}
-
-void
-gve_mask_all_queue_irqs(struct gve_priv *priv)
-{
-	for (int idx = 0; idx < priv->tx_cfg.num_queues; idx++) {
-		struct gve_tx_ring *tx = &priv->tx[idx];
-		gve_db_bar_write_4(priv, tx->com.irq_db_offset, GVE_IRQ_MASK);
-	}
-	for (int idx = 0; idx < priv->rx_cfg.num_queues; idx++) {
-		struct gve_rx_ring *rx = &priv->rx[idx];
-		gve_db_bar_write_4(priv, rx->com.irq_db_offset, GVE_IRQ_MASK);
 	}
 }

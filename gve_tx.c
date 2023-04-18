@@ -36,7 +36,7 @@ gve_tx_fifo_init(struct gve_priv *priv, struct gve_tx_fifo *fifo,
     struct gve_queue_page_list *qpl)
 {
 	fifo->base = vmap(qpl->pages, qpl->num_entries, VM_MAP, PAGE_KERNEL);
-	if (unlikely(fifo->base == NULL)) {
+	if (fifo->base == NULL) {
 		device_printf(priv->dev, "Failed to vmap fifo, qpl_id = %d\n",
 		    qpl->id);
 		return (ENOMEM);
@@ -51,9 +51,51 @@ gve_tx_fifo_init(struct gve_priv *priv, struct gve_tx_fifo *fifo,
 static void
 gve_tx_fifo_release(struct gve_priv *priv, struct gve_tx_fifo *fifo)
 {
+	if (fifo->base == NULL)
+		return;
+
 	if (atomic_read(&fifo->available) != fifo->size)
 		device_printf(priv->dev, "Releasing non-empty fifo");
 	vunmap(fifo->base);
+}
+
+static void
+gve_tx_free_ring(struct gve_priv *priv, int i)
+{
+	struct gve_tx_ring *tx = &priv->tx[i];
+	struct gve_ring_com *com = &tx->com;
+
+	/* Safe to call even if never alloced */
+	gve_free_counters((counter_u64_t *)&tx->stats, NUM_TX_STATS);
+
+	if (tx->br != NULL) {
+		buf_ring_free(tx->br, M_DEVBUF);
+		tx->br = NULL;
+	}
+
+	if (mtx_initialized(&tx->ring_mtx))
+		mtx_destroy(&tx->ring_mtx);
+
+	if (tx->info != NULL) {
+		free(tx->info, M_GVE);
+		tx->info = NULL;
+	}
+
+	/* Safe to call even if never allocated */
+	gve_tx_fifo_release(priv, &tx->fifo);
+
+	/* Safe to call even if never assigned */
+	gve_unassign_qpl(priv, com->qpl->id);
+
+	if (tx->desc_ring != NULL) {
+		gve_dma_free_coherent(&tx->desc_ring_mem);
+		tx->desc_ring = NULL;
+	}
+
+	if (com->q_resources != NULL) {
+		gve_dma_free_coherent(&com->q_resources_mem);
+		com->q_resources = NULL;
+	}
 }
 
 static int
@@ -72,13 +114,34 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 		device_printf(priv->dev, "No QPL left for tx ring %d i", i);
 		return (ENOMEM);
 	}
+	err = gve_tx_fifo_init(priv, &tx->fifo, com->qpl);
+	if (err != 0)
+		goto abort;
+
+	tx->info = malloc(sizeof(struct gve_tx_buffer_state) * priv->tx_desc_cnt,
+		       M_GVE, M_WAITOK | M_ZERO);
+	if (tx->info == NULL) {
+		device_printf(priv->dev, "Cannot alloc buf state array for tx ring %d", i);
+		goto abort;
+	}
+
+	sprintf(mtx_name, "gvetx%d", i);
+	mtx_init(&tx->ring_mtx, mtx_name, NULL, MTX_DEF);
+
+	tx->br = buf_ring_alloc(GVE_TX_BUFRING_ENTRIES, M_DEVBUF, M_WAITOK, &tx->ring_mtx);
+	if (tx->br == NULL) {
+		device_printf(priv->dev, "Cannot alloc buf ring for tx ring %d", i);
+		goto abort;
+	}
+
+	gve_alloc_counters((counter_u64_t *)&tx->stats, NUM_TX_STATS);
 
 	err = gve_dma_alloc_coherent(priv, sizeof(struct gve_queue_resources),
-	          PAGE_SIZE, &com->q_resources_mem,
+		  PAGE_SIZE, &com->q_resources_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
 		device_printf(priv->dev, "Cannot alloc queue resources for tx ring %d", i);
-		goto abort_with_qpl;
+		goto abort;
 	}
 	com->q_resources = com->q_resources_mem.cpu_addr;
 
@@ -88,75 +151,15 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
 		device_printf(priv->dev, "Cannot alloc desc ring for tx ring %d", i);
-		goto abort_with_q_resources;
+		goto abort;
 	}
 	tx->desc_ring = tx->desc_ring_mem.cpu_addr;
 
-	err = gve_tx_fifo_init(priv, &tx->fifo, com->qpl);
-	if (err != 0)
-		goto abort_with_desc_ring;
-
-	tx->info = malloc(sizeof(struct gve_tx_buffer_state) * priv->tx_desc_cnt,
-		       M_GVE, M_WAITOK | M_ZERO);
-	if (tx->info == NULL) {
-		device_printf(priv->dev, "Cannot alloc buf state array for tx ring %d", i);
-		goto abort_with_fifo;
-	}
-
-	sprintf(mtx_name, "gvetx%d", i);
-	mtx_init(&tx->ring_mtx, mtx_name, NULL, MTX_DEF);
-
-	tx->br = buf_ring_alloc(GVE_TX_BUFRING_SIZE, M_DEVBUF, M_WAITOK, &tx->ring_mtx);
-	if (tx->br == NULL) {
-		device_printf(priv->dev, "Cannot alloc buf ring for tx ring %d", i);
-		goto abort_with_iovec;
-	}
-
-	gve_alloc_counters((counter_u64_t *)&tx->stats, NUM_TX_STATS);
-
 	return (0);
 
-abort_with_iovec:
-	free(tx->info, M_GVE);
-	tx->info = NULL;
-abort_with_fifo:
-	gve_tx_fifo_release(priv, &tx->fifo);
-abort_with_desc_ring:
-	gve_dma_free_coherent(&com->q_resources_mem);
-	tx->desc_ring = NULL;
-abort_with_q_resources:
-	gve_dma_free_coherent(&com->q_resources_mem);
-	com->q_resources = NULL;
-abort_with_qpl:
-	gve_unassign_qpl(priv, com->qpl->id);
+abort:
+	gve_tx_free_ring(priv, i);
 	return (err);
-}
-
-static void
-gve_tx_free_ring(struct gve_priv *priv, int i)
-{
-	struct gve_tx_ring *tx = &priv->tx[i];
-	struct gve_ring_com *com = &tx->com;
-
-	gve_free_counters((counter_u64_t *)&tx->stats, NUM_TX_STATS);
-
-	buf_ring_free(tx->br, M_DEVBUF);
-	tx->br = NULL;
-
-	mtx_destroy(&tx->ring_mtx);
-
-	free(tx->info, M_GVE);
-	tx->info = NULL;
-
-	gve_tx_fifo_release(priv, &tx->fifo);
-
-	gve_dma_free_coherent(&tx->desc_ring_mem);
-	tx->desc_ring = NULL;
-
-	gve_dma_free_coherent(&com->q_resources_mem);
-	com->q_resources = NULL;
-
-	gve_unassign_qpl(priv, com->qpl->id);
 }
 
 int
@@ -184,9 +187,8 @@ gve_alloc_tx_rings(struct gve_priv *priv)
 	return (0);
 
 free_rings:
-	while (i--) {
+	while (i--)
 		gve_tx_free_ring(priv, i);
-	}
 	free(priv->tx, M_GVE);
 	return (err);
 }
@@ -203,13 +205,41 @@ gve_free_tx_rings(struct gve_priv *priv)
 }
 
 static void
+gve_tx_clear_desc_ring(struct gve_tx_ring *tx)
+{
+	struct gve_ring_com *com = &tx->com;
+	int i;
+
+	for (i = 0; i < com->priv->tx_desc_cnt; i++) {
+		tx->desc_ring[i] = (union gve_tx_desc){};
+		tx->info[i] = (struct gve_tx_buffer_state){};
+	}
+
+	bus_dmamap_sync(tx->desc_ring_mem.tag, tx->desc_ring_mem.map,
+	    BUS_DMASYNC_PREWRITE);
+}
+
+static void
+gve_clear_tx_ring(struct gve_priv *priv, int i)
+{
+	struct gve_tx_ring *tx = &priv->tx[i];
+	struct gve_tx_fifo *fifo = &tx->fifo;
+
+	tx->req = 0;
+	tx->done = 0;
+	tx->mask = priv->tx_desc_cnt - 1;
+
+	atomic_set(&fifo->available, fifo->size);
+	fifo->head = 0;
+
+	gve_tx_clear_desc_ring(tx);
+}
+
+static void
 gve_start_tx_ring(struct gve_priv *priv, int i)
 {
 	struct gve_tx_ring *tx = &priv->tx[i];
 	struct gve_ring_com *com = &tx->com;
-
-	tx->req = tx->done = 0;
-	tx->mask = priv->tx_desc_cnt - 1;
 
 	NET_TASK_INIT(&com->cleanup_task, 0, gve_tx_cleanup_tq, tx);
 	com->cleanup_tq = taskqueue_create_fast("gve tx", M_WAITOK,
@@ -222,9 +252,6 @@ gve_start_tx_ring(struct gve_priv *priv, int i)
 		          M_WAITOK, taskqueue_thread_enqueue, &tx->xmit_tq);
 	taskqueue_start_threads(&tx->xmit_tq, 1, PI_NET, "%s txq %d xmit",
 	    device_get_nameunit(priv->dev), i);
-
-	bus_dmamap_sync(tx->desc_ring_mem.tag, tx->desc_ring_mem.map,
-	    BUS_DMASYNC_PREWRITE);
 }
 
 int
@@ -236,7 +263,10 @@ gve_create_tx_rings(struct gve_priv *priv)
 	int i;
 
 	if (gve_get_state_flag(priv, GVE_STATE_FLAG_TX_RINGS_OK))
-	    return (0);
+		return (0);
+
+	for (i = 0; i < priv->tx_cfg.num_queues; i++)
+		gve_clear_tx_ring(priv, i);
 
 	err = gve_adminq_create_tx_queues(priv, priv->tx_cfg.num_queues);
 	if (err != 0)
@@ -284,17 +314,16 @@ gve_destroy_tx_rings(struct gve_priv *priv)
 	int err;
 	int i;
 
-	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_TX_RINGS_OK))
-	    return (0);
-
 	for (i = 0; i < priv->tx_cfg.num_queues; i++)
 		gve_stop_tx_ring(priv, i);
 
-	err = gve_adminq_destroy_tx_queues(priv, priv->tx_cfg.num_queues);
-	if (err != 0)
-		return (err);
+	if (gve_get_state_flag(priv, GVE_STATE_FLAG_TX_RINGS_OK)) {
+		err = gve_adminq_destroy_tx_queues(priv, priv->tx_cfg.num_queues);
+		if (err != 0)
+			return (err);
+		gve_clear_state_flag(priv, GVE_STATE_FLAG_TX_RINGS_OK);
+	}
 
-	gve_clear_state_flag(priv, GVE_STATE_FLAG_TX_RINGS_OK);
 	return (0);
 }
 
@@ -328,40 +357,6 @@ gve_tx_free_fifo(struct gve_tx_fifo *fifo, size_t bytes)
 	atomic_add(bytes, &fifo->available);
 }
 
-static void
-gve_tx_cleanup(struct gve_priv *priv, struct gve_tx_ring *tx, int todo)
-{
-	struct gve_tx_buffer_state *info;
-	size_t space_freed = 0;
-	struct mbuf *mbuf;
-	int i, j;
-	uint32_t idx;
-
-	for (j = 0; j < todo; j++) {
-		idx = tx->done & tx->mask;
-		info = &tx->info[idx];
-		mbuf = info->mbuf;
-		tx->done++;
-
-		if (mbuf != NULL) {
-			info->mbuf = NULL;
-			counter_enter();
-			counter_u64_add_protected(tx->stats.tbytes, mbuf->m_pkthdr.len);
-			counter_u64_add_protected(tx->stats.tpackets, 1);
-			counter_exit();
-			m_freem(mbuf);
-
-			for (i = 0; i < ARRAY_SIZE(info->iov); i++) {
-				space_freed += info->iov[i].iov_len + info->iov[i].iov_padding;
-				info->iov[i].iov_len = 0;
-				info->iov[i].iov_padding = 0;
-			}
-		}
-	}
-
-	gve_tx_free_fifo(&tx->fifo, space_freed);
-}
-
 void
 gve_tx_cleanup_tq(void *arg, int pending)
 {
@@ -369,10 +364,36 @@ gve_tx_cleanup_tq(void *arg, int pending)
 	struct gve_priv *priv = tx->com.priv;
 	uint32_t nic_done = gve_tx_load_event_counter(priv, tx);
 	uint32_t todo = nic_done - tx->done;
+	size_t space_freed = 0;
+	int i, j;
 
-	gve_tx_cleanup(priv, tx, todo);
+	for (j = 0; j < todo; j++) {
+		uint32_t idx = tx->done & tx->mask;
+		struct gve_tx_buffer_state *info = &tx->info[idx];
+		struct mbuf *mbuf = info->mbuf;
+
+		tx->done++;
+		if (mbuf == NULL)
+			continue;
+
+		info->mbuf = NULL;
+		counter_enter();
+		counter_u64_add_protected(tx->stats.tbytes, mbuf->m_pkthdr.len);
+		counter_u64_add_protected(tx->stats.tpackets, 1);
+		counter_exit();
+		m_freem(mbuf);
+
+		for (i = 0; i < ARRAY_SIZE(info->iov); i++) {
+			space_freed += info->iov[i].iov_len + info->iov[i].iov_padding;
+			info->iov[i].iov_len = 0;
+			info->iov[i].iov_padding = 0;
+		}
+	}
+
+	gve_tx_free_fifo(&tx->fifo, space_freed);
+
 	gve_db_bar_write_4(priv, tx->com.irq_db_offset,
-			   GVE_IRQ_ACK | GVE_IRQ_EVENT);
+	    GVE_IRQ_ACK | GVE_IRQ_EVENT);
 
 	/* Completions born before this barrier MAY NOT cause the NIC to send an
 	 * interrupt but they will still be handled by the enqueue below.
@@ -404,57 +425,55 @@ gve_dma_sync_for_device(struct gve_queue_page_list *qpl,
 }
 
 static void
-gve_tx_fill_mtd_desc(union gve_tx_desc *mtd_desc, struct mbuf *mbuf)
+gve_tx_fill_mtd_desc(struct gve_tx_mtd_desc *mtd_desc, struct mbuf *mbuf)
 {
-	BUILD_BUG_ON(sizeof(mtd_desc->mtd) != sizeof(mtd_desc->pkt));
-
-	mtd_desc->mtd.type_flags = GVE_TXD_MTD | GVE_MTD_SUBTYPE_PATH;
-	mtd_desc->mtd.path_state = GVE_MTD_PATH_STATE_DEFAULT |
-				   GVE_MTD_PATH_HASH_L4;
-	mtd_desc->mtd.path_hash = htobe32(mbuf->m_pkthdr.flowid);
-	mtd_desc->mtd.reserved0 = 0;
-	mtd_desc->mtd.reserved1 = 0;
+	mtd_desc->type_flags = GVE_TXD_MTD | GVE_MTD_SUBTYPE_PATH;
+	mtd_desc->path_state = GVE_MTD_PATH_STATE_DEFAULT |
+	    GVE_MTD_PATH_HASH_L4;
+	mtd_desc->path_hash = htobe32(mbuf->m_pkthdr.flowid);
+	mtd_desc->reserved0 = 0;
+	mtd_desc->reserved1 = 0;
 }
 
 static void
-gve_tx_fill_pkt_desc(union gve_tx_desc *pkt_desc, bool is_tso,
+gve_tx_fill_pkt_desc(struct gve_tx_pkt_desc *pkt_desc, bool is_tso,
 		     uint16_t l4_hdr_offset, uint32_t desc_cnt,
 		     uint16_t first_seg_len, uint64_t addr, bool has_csum_flag,
 		     int csum_offset, uint16_t pkt_len)
 {
 	if (is_tso) {
-		pkt_desc->pkt.type_flags = GVE_TXD_TSO | GVE_TXF_L4CSUM;
-		pkt_desc->pkt.l4_csum_offset = csum_offset >> 1;
-		pkt_desc->pkt.l4_hdr_offset = l4_hdr_offset >> 1;
+		pkt_desc->type_flags = GVE_TXD_TSO | GVE_TXF_L4CSUM;
+		pkt_desc->l4_csum_offset = csum_offset >> 1;
+		pkt_desc->l4_hdr_offset = l4_hdr_offset >> 1;
 	} else if (has_csum_flag) {
-		pkt_desc->pkt.type_flags = GVE_TXD_STD | GVE_TXF_L4CSUM;
-		pkt_desc->pkt.l4_csum_offset = csum_offset >> 1;
-		pkt_desc->pkt.l4_hdr_offset = l4_hdr_offset >> 1;
+		pkt_desc->type_flags = GVE_TXD_STD | GVE_TXF_L4CSUM;
+		pkt_desc->l4_csum_offset = csum_offset >> 1;
+		pkt_desc->l4_hdr_offset = l4_hdr_offset >> 1;
 	} else {
-		pkt_desc->pkt.type_flags = GVE_TXD_STD;
-		pkt_desc->pkt.l4_csum_offset = 0;
-		pkt_desc->pkt.l4_hdr_offset = 0;
+		pkt_desc->type_flags = GVE_TXD_STD;
+		pkt_desc->l4_csum_offset = 0;
+		pkt_desc->l4_hdr_offset = 0;
 	}
-	pkt_desc->pkt.desc_cnt = desc_cnt;
-	pkt_desc->pkt.len = htobe16(pkt_len);
-	pkt_desc->pkt.seg_len = htobe16(first_seg_len);
-	pkt_desc->pkt.seg_addr = htobe64(addr);
+	pkt_desc->desc_cnt = desc_cnt;
+	pkt_desc->len = htobe16(pkt_len);
+	pkt_desc->seg_len = htobe16(first_seg_len);
+	pkt_desc->seg_addr = htobe64(addr);
 }
 
 static void
-gve_tx_fill_seg_desc(union gve_tx_desc *seg_desc,
+gve_tx_fill_seg_desc(struct gve_tx_seg_desc *seg_desc,
 		     bool is_tso, uint16_t len, uint64_t addr,
 		     bool is_ipv6, uint8_t l3_off, uint16_t tso_mss)
 {
-	seg_desc->seg.type_flags = GVE_TXD_SEG;
+	seg_desc->type_flags = GVE_TXD_SEG;
 	if (is_tso) {
 		if (is_ipv6)
-			seg_desc->seg.type_flags |= GVE_TXSF_IPV6;
-		seg_desc->seg.l3_offset = l3_off >> 1;
-		seg_desc->seg.mss = htobe16(tso_mss);
+			seg_desc->type_flags |= GVE_TXSF_IPV6;
+		seg_desc->l3_offset = l3_off >> 1;
+		seg_desc->mss = htobe16(tso_mss);
 	}
-	seg_desc->seg.seg_len = htobe16(len);
-	seg_desc->seg.seg_addr = htobe64(addr);
+	seg_desc->seg_len = htobe16(len);
+	seg_desc->seg_addr = htobe64(addr);
 }
 
 static inline uint32_t
@@ -466,14 +485,14 @@ gve_tx_avail(struct gve_tx_ring *tx)
 static bool
 gve_tx_fifo_can_alloc(struct gve_tx_fifo *fifo, size_t bytes)
 {
-	return (atomic_read(&fifo->available) <= bytes) ? false : true;
+	return atomic_read(&fifo->available) >= bytes;
 }
 
 static inline bool
 gve_can_tx(struct gve_tx_ring *tx, int bytes_required)
 {
-	bool can_alloc = gve_tx_fifo_can_alloc(&tx->fifo, bytes_required);
-	return (gve_tx_avail(tx) >= (GVE_TX_MAX_IOVEC + 1) && can_alloc);
+	return (gve_tx_avail(tx) >= (GVE_TX_MAX_DESCS + 1) &&
+	    gve_tx_fifo_can_alloc(&tx->fifo, bytes_required));
 }
 
 static int
@@ -555,8 +574,10 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 	int csum_flags, csum_offset, mtd_desc_nr, offset, copy_offset;
 	uint16_t tso_mss, l4_off, l4_data_off, pkt_len, first_seg_len;
 	int pad_bytes, hdr_nfrags, payload_nfrags;
-	union gve_tx_desc *pkt_desc, *seg_desc;
 	bool is_tso, has_csum_flag, is_ipv6;
+	struct gve_tx_pkt_desc *pkt_desc;
+	struct gve_tx_seg_desc *seg_desc;
+	struct gve_tx_mtd_desc *mtd_desc;
 	struct gve_tx_buffer_state *info;
 	uint32_t idx = tx->req & tx->mask;
 	struct ether_vlan_header *eh;
@@ -634,7 +655,7 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 	payload_nfrags = gve_tx_alloc_fifo(&tx->fifo, pkt_len - first_seg_len,
 			     &info->iov[payload_iov]);
 
-	pkt_desc = &tx->desc_ring[idx];
+	pkt_desc = &tx->desc_ring[idx].pkt;
 	gve_tx_fill_pkt_desc(pkt_desc, is_tso, l4_off,
 	    1 + mtd_desc_nr + payload_nfrags, first_seg_len,
 	    info->iov[hdr_nfrags - 1].iov_offset, has_csum_flag, csum_offset,
@@ -649,12 +670,13 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 
 	if (mtd_desc_nr == 1) {
 		next_idx = (tx->req + 1) & tx->mask;
-		gve_tx_fill_mtd_desc(&tx->desc_ring[next_idx], mbuf);
+		mtd_desc = &tx->desc_ring[next_idx].mtd;
+		gve_tx_fill_mtd_desc(mtd_desc, mbuf);
 	}
 
 	for (i = payload_iov; i < payload_nfrags + payload_iov; i++) {
 		next_idx = (tx->req + 1 + mtd_desc_nr + i - payload_iov) & tx->mask;
-		seg_desc = &tx->desc_ring[next_idx];
+		seg_desc = &tx->desc_ring[next_idx].seg;
 
 		gve_tx_fill_seg_desc(seg_desc, is_tso, info->iov[i].iov_len,
 		    info->iov[i].iov_offset, is_ipv6, l3_off, tso_mss);
@@ -697,6 +719,7 @@ gve_xmit_br(struct gve_tx_ring *tx)
 		gve_db_bar_write_4(priv, tx->com.db_offset, tx->req);
 
 		drbr_advance(ifp, tx->br);
+                BPF_MTAP(ifp, mbuf);
 	}
 }
 

@@ -44,18 +44,14 @@
 #define GVE_DOORBELL_BAR	2
 
 /* Driver can alloc up to 2 segments for the header and 2 for the payload. */
-#define GVE_TX_MAX_IOVEC	4
-#define GVE_TX_BUFRING_SIZE	4096
+#define GVE_TX_MAX_DESCS	4
+#define GVE_TX_BUFRING_ENTRIES	4096
 
-#define GVE_MIN_RING_SIZE 64
-#define GVE_MAX_RING_SIZE 12288
 #define ADMINQ_SIZE 4096
 
-#define NUM_RX_STATS 8
-#define NUM_TX_STATS 6
-
-#define GVE_DEFAULT_RX_BUFFER_SIZE (ADMINQ_SIZE / 2)
-#define GVE_DEFAULT_RX_BUFFER_OFFSET (ADMINQ_SIZE / 2)
+/* Each RX bounce buffer page can fit two packet buffers. */
+#define GVE_DEFAULT_RX_BUFFER_SIZE (PAGE_SIZE / 2)
+#define GVE_DEFAULT_RX_BUFFER_OFFSET (PAGE_SIZE / 2)
 
 /* Number of descriptors per queue page list.
  * Page count AKA QPL size can be derived by dividing the number of elements in
@@ -65,20 +61,12 @@
 
 static MALLOC_DEFINE(M_GVE, "gve", "gve allocations");
 
-struct gve_dma_handle
-{
+struct gve_dma_handle {
 	bus_addr_t	bus_addr;
 	void		*cpu_addr;
 	bus_dma_tag_t	tag;
 	bus_dmamap_t	map;
 	int		size;
-};
-
-/* Each slot in the desc ring has a 1:1 mapping to a slot in the data ring */
-struct gve_rx_desc_queue {
-	struct gve_rx_desc *desc_ring; /* the descriptor ring */
-	dma_addr_t bus; /* the bus for the desc_ring */
-	uint8_t seqno; /* the next expected seqno for this desc*/
 };
 
 union gve_tx_desc {
@@ -136,7 +124,6 @@ enum gve_state_flags_bit {
 
 #define GVE_DEVICE_STATUS_RESET (0x1 << 1)
 #define GVE_DEVICE_STATUS_LINK_STATUS (0x1 << 2)
-#define GVE_DEVICE_STATUS_REPORT_STATS (0x1 << 3)
 
 #define GVE_RING_LOCK(ring)	mtx_lock(&(ring)->ring_mtx)
 #define GVE_RING_TRYLOCK(ring)	mtx_trylock(&(ring)->ring_mtx)
@@ -174,7 +161,7 @@ struct gve_rx_slot_page_info {
  * reconstructed using the information in this structure.
  */
 struct gve_rx_ctx {
-	/* head and tail of mbuf chain for the current packet or NULL if none */
+	/* head and tail of mbuf chain for the current packet */
 	struct mbuf *mbuf_head;
 	struct mbuf *mbuf_tail;
 	uint32_t total_size;
@@ -232,30 +219,36 @@ struct gve_rxq_stats {
 	counter_u64_t rx_dropped_pkt_mbuf_alloc_fail;
 };
 
+#define NUM_RX_STATS (sizeof(struct gve_rxq_stats) / sizeof(counter_u64_t))
+
+/* power-of-2 sized receive ring */
 struct gve_rx_ring {
 	struct gve_ring_com com;
-
-	struct gve_rx_ctx ctx;
-
 	struct gve_dma_handle desc_ring_mem;
-	struct gve_rx_desc *desc_ring;
-	uint8_t seq_no;
-
 	struct gve_dma_handle data_ring_mem;
-	union gve_rx_data_slot *data_ring;
 
-	struct gve_rx_slot_page_info *page_info;
+	/* accessed in the receive hot path */
+	struct {
+		struct gve_rx_desc *desc_ring;
+		union gve_rx_data_slot *data_ring;
+		struct gve_rx_slot_page_info *page_info;
 
-	struct lro_ctrl lro;
-
-	struct gve_rxq_stats stats;
-	uint32_t cnt; /* free-running total number of completed packets */
-	uint32_t fill_cnt; /* free-running total number of descs and buffs posted */
-	uint32_t mask; /* masks the cnt and fill_cnt to the size of the ring */
+		struct gve_rx_ctx ctx;
+		struct lro_ctrl lro;
+		uint8_t seq_no; /* helps traverse the descriptor ring */
+		uint32_t cnt; /* free-running total number of completed packets */
+		uint32_t fill_cnt; /* free-running total number of descs and buffs posted */
+		uint32_t mask; /* masks the cnt and fill_cnt to the size of the ring */
+		struct gve_rxq_stats stats;
+	} __aligned(CACHE_LINE_SIZE);
 
 } __aligned(CACHE_LINE_SIZE);
 
-/* A TX buffer - each queue has one */
+/* A contiguous representation of the pages composing the Tx bounce buffer.
+ * The xmit taskqueue and the completion taskqueue both simultaneously use it.
+ * Both operate on `available`: the xmit tq lowers it and the completion tq
+ * raises it. `head` is the last location written at and so only the xmit tq
+ * uses it. */
 struct gve_tx_fifo {
 	void *base; /* address of base of FIFO */
 	uint32_t size; /* total size */
@@ -265,7 +258,7 @@ struct gve_tx_fifo {
 
 struct gve_tx_buffer_state {
 	struct mbuf *mbuf;
-	struct gve_tx_iovec iov[GVE_TX_MAX_IOVEC];
+	struct gve_tx_iovec iov[GVE_TX_MAX_DESCS];
 };
 
 struct gve_txq_stats {
@@ -277,30 +270,34 @@ struct gve_txq_stats {
 	counter_u64_t tx_dropped_pkt_nospace_bufring;
 };
 
+#define NUM_TX_STATS (sizeof(struct gve_txq_stats) / sizeof(counter_u64_t))
+
+/* power-of-2 sized transmit ring */
 struct gve_tx_ring {
 	struct gve_ring_com com;
-
 	struct gve_dma_handle desc_ring_mem;
-	union gve_tx_desc *desc_ring;
-	struct gve_tx_buffer_state *info;
-	uint8_t seq_no;
-
-	struct buf_ring *br;
-	struct mtx ring_mtx;
 
 	struct task xmit_task;
 	struct taskqueue *xmit_tq;
 
-	struct gve_tx_fifo fifo;
+	/* accessed in the transmit hot path */
+	struct {
+		union gve_tx_desc *desc_ring;
+		struct gve_tx_buffer_state *info;
+		struct buf_ring *br;
 
-	struct gve_txq_stats stats;
-	uint32_t req;
-	uint32_t done;
-	uint32_t mask;
+		struct gve_tx_fifo fifo;
+		struct mtx ring_mtx;
+
+		uint32_t req; /* free-running total number of packets written to the nic */
+		uint32_t done; /* free-running total number of completed packets */
+		uint32_t mask; /* masks the req and done to the size of the ring */
+		struct gve_txq_stats stats;
+	} __aligned(CACHE_LINE_SIZE);
+
 } __aligned(CACHE_LINE_SIZE);
 
-struct gve_priv
-{
+struct gve_priv {
 	if_t ifp;
 	device_t dev;
 	struct ifmedia media;
@@ -321,8 +318,6 @@ struct gve_priv
 	uint16_t tx_desc_cnt;
 	uint16_t rx_desc_cnt;
 	uint16_t rx_pages_per_qpl;
-	uint16_t max_rx_desc_cnt;
-	uint16_t max_tx_desc_cnt;
 	uint64_t max_registered_pages;
 	uint64_t num_registered_pages;
 	uint32_t supported_features;
@@ -344,12 +339,15 @@ struct gve_priv
 	struct gve_tx_ring *tx;
 	struct gve_rx_ring *rx;
 
-	union gve_adminq_command *adminq;
+	/* Admin queue - see gve_adminq.h
+	 * Since AQ cmds do not run in steady state, 32 bit counters suffice */
+	struct gve_adminq_command *adminq;
 	dma_addr_t adminq_bus_addr;
-	uint32_t adminq_mask;
-	uint32_t adminq_prod_cnt;
-	uint32_t adminq_cmd_fail;
-	uint32_t adminq_timeouts;
+	uint32_t adminq_mask; /* masks prod_cnt to adminq size */
+	uint32_t adminq_prod_cnt; /* free-running count of AQ cmds executed */
+	uint32_t adminq_cmd_fail; /* free-running count of AQ cmds failed */
+	uint32_t adminq_timeouts; /* free-running count of AQ cmds timeouts */
+	/* free-running count of each distinct AQ cmd executed */
 	uint32_t adminq_describe_device_cnt;
 	uint32_t adminq_cfg_device_resources_cnt;
 	uint32_t adminq_register_page_list_cnt;
@@ -360,15 +358,9 @@ struct gve_priv
 	uint32_t adminq_destroy_rx_queue_cnt;
 	uint32_t adminq_dcfg_device_resources_cnt;
 	uint32_t adminq_set_driver_parameter_cnt;
-	uint32_t adminq_report_stats_cnt;
-	uint32_t adminq_report_link_speed_cnt;
-	uint32_t adminq_get_ptype_map_cnt;
 	uint32_t adminq_verify_driver_compatibility_cnt;
 
-	/* Global stats */
-	uint32_t interface_up_cnt; /* count of times interface turned up since last reset */
-	uint32_t interface_down_cnt; /* count of times interface turned down since last reset */
-	uint32_t reset_cnt; /* count of reset */
+	uint32_t reset_cnt;
 
 	struct task service_task;
 	struct taskqueue *service_tq;
@@ -394,16 +386,17 @@ gve_clear_state_flag(struct gve_priv *priv, int pos)
 	clear_bit(pos, &priv->state_flags);
 }
 
+/* Defined in gve_main.c */
 void gve_schedule_reset(struct gve_priv *priv);
 
-/* Register access functions */
+/* Register access functions defined in gve_utils.c */
 uint32_t gve_reg_bar_read_4(struct gve_priv *priv, bus_size_t offset);
 uint64_t gve_reg_bar_read_8(struct gve_priv *priv, bus_size_t offset);
 void gve_reg_bar_write_4(struct gve_priv *priv, bus_size_t offset, uint32_t val);
 void gve_reg_bar_write_8(struct gve_priv *priv, bus_size_t offset, uint64_t val);
 void gve_db_bar_write_4(struct gve_priv *priv, bus_size_t offset, uint32_t val);
 
-/* QPL functions */
+/* QPL (Queue Page List) functions defined in gve_qpl.c */
 uint32_t gve_num_tx_qpls(struct gve_priv *priv);
 uint32_t gve_num_rx_qpls(struct gve_priv *priv);
 struct gve_queue_page_list * gve_assign_tx_qpl(struct gve_priv *priv);
@@ -414,7 +407,7 @@ void gve_free_qpls(struct gve_priv *priv);
 int gve_register_qpls(struct gve_priv *priv);
 int gve_unregister_qpls(struct gve_priv *priv);
 
-/* TX functions */
+/* TX functions defined in gve_tx.c */
 int gve_alloc_tx_rings(struct gve_priv *priv);
 void gve_free_tx_rings(struct gve_priv *priv);
 int gve_create_tx_rings(struct gve_priv *priv);
@@ -425,33 +418,32 @@ void gve_qflush(if_t ifp);
 void gve_xmit_tq(void *arg, int pending);
 void gve_tx_cleanup_tq(void *arg, int pending);
 
-/* RX functions */
+/* RX functions defined in gve_rx.c */
 int gve_alloc_rx_rings(struct gve_priv *priv);
 void gve_free_rx_rings(struct gve_priv *priv);
 int gve_create_rx_rings(struct gve_priv *priv);
 int gve_destroy_rx_rings(struct gve_priv *priv);
-void gve_prefill_rx_slots(struct gve_rx_ring *rx);
 int gve_rx_intr(void *arg);
 void gve_rx_cleanup_tq(void *arg, int pending);
 
-/* DMA functions */
+/* DMA functions defined in gve_utils.c */
 int gve_dma_alloc_coherent(struct gve_priv *priv, int size, int align,
     struct gve_dma_handle *dma, int mapflags);
 void gve_dma_free_coherent(struct gve_dma_handle *dma);
 
-/* IRQ functions */
+/* IRQ functions defined in gve_utils.c */
 void gve_free_irqs(struct gve_priv *priv);
 int gve_alloc_irqs(struct gve_priv *priv);
 void gve_unmask_all_queue_irqs(struct gve_priv *priv);
 void gve_mask_all_queue_irqs(struct gve_priv *priv);
 
-/* Systcl functions */
+/* Systcl functions defined in gve_sysctl.c*/
 void gve_setup_sysctl(struct gve_priv *priv);
 void gve_accum_stats(struct gve_priv *priv, uint64_t *rpackets,
     uint64_t *rbytes, uint64_t *rx_dropped_pkt, uint64_t *tpackets,
     uint64_t *tbytes, uint64_t *tx_dropped_pkt);
 
-/* Stats functions */
+/* Stats functions defined in gve_utils.c */
 void gve_alloc_counters(counter_u64_t *stat, int num_stats);
 void gve_free_counters(counter_u64_t *stat, int num_stats);
 

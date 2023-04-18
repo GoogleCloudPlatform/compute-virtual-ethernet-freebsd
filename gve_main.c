@@ -31,14 +31,13 @@
 #include "gve.h"
 #include "gve_adminq.h"
 
-#define GVE_DRIVER_VERSION "GVE-0.9.0\n"
+#define GVE_DRIVER_VERSION "GVE-FBSD-0.9.1\n"
 #define GVE_VERSION_MAJOR 0
 #define GVE_VERSION_MINOR 9
 #define GVE_VERSION_SUB	0
 
-#define GVE_DEFAULT_RX_COPYBREAK (256)
+#define GVE_DEFAULT_RX_COPYBREAK 256
 #define GVE_TX_TSO_SEGMENTS_MAX 18
-#define GVE_TSO_MAXSIZE	65535
 #define GVE_TSO_MAX_SIZE 65535
 #define GVE_TSO_MAXSEG_SIZE 65535
 
@@ -76,12 +75,8 @@ gve_verify_driver_compatibility(struct gve_priv *priv)
 		},
 	};
 
-	int string_size = sizeof(driver_info->os_version_str1);
-	char release[string_size];
-	snprintf(release, string_size, "FreeBSD %u", __FreeBSD_version);
-
-	strscpy(driver_info->os_version_str1, release,
-	sizeof(driver_info->os_version_str1));
+	snprintf(driver_info->os_version_str1, sizeof(driver_info->os_version_str1),
+	    "FreeBSD %u", __FreeBSD_version);
 
 	bus_dmamap_sync(
 	    driver_info_mem.tag, driver_info_mem.map, BUS_DMASYNC_PREREAD);
@@ -102,11 +97,12 @@ gve_verify_driver_compatibility(struct gve_priv *priv)
 static int
 gve_up(struct gve_priv *priv)
 {
+	if_t ifp = priv->ifp;
 	int err;
 
 	GVE_GLOBAL_LOCK_ASSERT();
 
-	if (unlikely(device_is_attached(priv->dev) == 0)) {
+	if (device_is_attached(priv->dev) == 0) {
 		device_printf(priv->dev, "device is not attached!\n");
 		return (ENXIO);
 	}
@@ -114,18 +110,14 @@ gve_up(struct gve_priv *priv)
 	if (gve_get_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP))
 		return (0);
 
-	if_t ifp = priv->ifp;
-	if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
-	gve_mask_all_queue_irqs(priv);
-
 	if_clearhwassist(ifp);
-	if ((if_getcapenable(ifp) & IFCAP_TXCSUM) != 0)
+	if (if_getcapenable(ifp) & IFCAP_TXCSUM)
 		if_sethwassistbits(ifp, CSUM_TCP | CSUM_UDP, 0);
-	if ((if_getcapenable(ifp) & IFCAP_TXCSUM_IPV6) != 0)
+	if (if_getcapenable(ifp) & IFCAP_TXCSUM_IPV6)
 		if_sethwassistbits(ifp, CSUM_IP6_TCP | CSUM_IP6_UDP, 0);
-	if ((if_getcapenable(ifp) & IFCAP_TSO4) != 0)
+	if (if_getcapenable(ifp) & IFCAP_TSO4)
 		if_sethwassistbits(ifp, CSUM_IP_TSO, 0);
-	if ((if_getcapenable(ifp) & IFCAP_TSO6) != 0)
+	if (if_getcapenable(ifp) & IFCAP_TSO6)
 		if_sethwassistbits(ifp, CSUM_IP6_TSO, 0);
 
 	err = gve_register_qpls(priv);
@@ -140,12 +132,11 @@ gve_up(struct gve_priv *priv)
 	if (err != 0)
 		goto reset;
 
-	if_setdrvflagbits(priv->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
-	if_link_state_change(priv->ifp, LINK_STATE_UP);
+	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
+	if_link_state_change(ifp, LINK_STATE_UP);
 	gve_set_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 
 	gve_unmask_all_queue_irqs(priv);
-
 	gve_set_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP);
 	return (0);
 
@@ -162,6 +153,9 @@ gve_down(struct gve_priv *priv)
 	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP))
 		return;
 
+	if_link_state_change(priv->ifp, LINK_STATE_DOWN);
+	if_setdrvflagbits(priv->ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
+
 	if (gve_destroy_rx_rings(priv) != 0)
 		goto reset;
 
@@ -171,7 +165,6 @@ gve_down(struct gve_priv *priv)
 	if (gve_unregister_qpls(priv) != 0)
 		goto reset;
 
-	if_setdrvflagbits(priv->ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP);
 
 	return;
@@ -186,14 +179,14 @@ gve_set_mtu(if_t ifp, uint32_t new_mtu)
 	int err;
 	struct gve_priv *priv = ifp->if_softc;
 
-	if ((new_mtu > priv->max_mtu) || (new_mtu < ETH_MIN_MTU)) {
+	if ((new_mtu > priv->max_mtu) || (new_mtu < ETHERMIN)) {
 		device_printf(priv->dev, "Invalid New MTU setting. new_mtu: %d max mtu: %d min mtu: %d\n",
-		    new_mtu, priv->max_mtu, ETH_MIN_MTU);
+		    new_mtu, priv->max_mtu, ETHERMIN);
 		return (EINVAL);
 	}
 
 	err = gve_adminq_set_mtu(priv, new_mtu);
-	if (likely(err == 0)) {
+	if (err == 0) {
 		device_printf(priv->dev, "MTU set to %d\n", new_mtu);
 		if_setmtu(ifp, new_mtu);
 	} else {
@@ -235,6 +228,7 @@ gve_ioctl(if_t ifp, u_long command, caddr_t data)
 		rc = gve_up(priv);
 		GVE_GLOBAL_LOCK_UNLOCK();
 		break;
+
 	case SIOCSIFFLAGS:
 		if ((ifp->if_flags & IFF_UP) != 0) {
 			if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0) {
@@ -250,10 +244,23 @@ gve_ioctl(if_t ifp, u_long command, caddr_t data)
 			}
 		}
 		break;
+
+	case SIOCSIFCAP:
+		if (ifr->ifr_reqcap == ifp->if_capenable)
+			break;
+		GVE_GLOBAL_LOCK_LOCK();
+		gve_down(priv);
+		ifp->if_capenable = ifr->ifr_reqcap;
+		rc = gve_up(priv);
+		GVE_GLOBAL_LOCK_UNLOCK();
+		break;
+
 	case SIOCSIFMEDIA:
+		/* FALLTHROUGH */
 	case SIOCGIFMEDIA:
 		rc = ifmedia_ioctl(ifp, ifr, &priv->media, command);
 		break;
+
 	default:
 		rc = ether_ioctl(ifp, command, data);
 		break;
@@ -291,7 +298,8 @@ gve_media_status(if_t ifp, struct ifmediareq *ifmr)
 	GVE_GLOBAL_LOCK_UNLOCK();
 }
 
-static uint64_t	gve_get_counter(if_t ifp, ift_counter cnt) {
+static uint64_t
+gve_get_counter(if_t ifp, ift_counter cnt) {
 	struct gve_priv *priv;
 	uint64_t rpackets = 0;
 	uint64_t tpackets = 0;
@@ -308,16 +316,22 @@ static uint64_t	gve_get_counter(if_t ifp, ift_counter cnt) {
 	switch (cnt) {
 	case IFCOUNTER_IPACKETS:
 		return (rpackets);
+
 	case IFCOUNTER_OPACKETS:
 		return (tpackets);
+
 	case IFCOUNTER_IBYTES:
 		return (rbytes);
+
 	case IFCOUNTER_OBYTES:
 		return (tbytes);
+
 	case IFCOUNTER_IQDROPS:
 		return (rx_dropped_pkt);
+
 	case IFCOUNTER_OQDROPS:
 		return (tx_dropped_pkt);
+
 	default:
 		return (if_get_counter_default(ifp, cnt));
 	}
@@ -330,7 +344,7 @@ gve_setup_ifnet(device_t dev, struct gve_priv *priv)
 	if_t ifp;
 
 	ifp = priv->ifp = if_alloc(IFT_ETHER);
-	if (unlikely(ifp == NULL)) {
+	if (ifp == NULL) {
 		device_printf(priv->dev, "Cannot allocate ifnet struct\n");
 		return (ENXIO);
 	}
@@ -358,9 +372,12 @@ gve_setup_ifnet(device_t dev, struct gve_priv *priv)
 	if_setcapabilities(ifp, caps);
 	if_setcapenable(ifp, caps);
 
-	if_sethwtsomax(ifp, min(GVE_TSO_MAXSIZE, IP_MAXPACKET));
+	if_sethwtsomax(ifp, min(GVE_TSO_MAX_SIZE, IP_MAXPACKET));
 	if_sethwtsomaxsegcount(ifp, GVE_TX_TSO_SEGMENTS_MAX - 3);
 	if_sethwtsomaxsegsize(ifp, GVE_TSO_MAXSEG_SIZE);
+
+	device_printf(priv->dev, "Setting initial MTU to %d\n", priv->max_mtu);
+	if_setmtu(ifp, priv->max_mtu);
 
 	ether_ifattach(ifp, priv->mac);
 
@@ -388,8 +405,9 @@ gve_alloc_counter_array(struct gve_priv *priv)
 static void
 gve_free_counter_array(struct gve_priv *priv)
 {
-	gve_dma_free_coherent(&priv->counter_array_mem);
-	priv->counter_array_mem = (struct gve_dma_handle){0};
+	if (priv->counters != NULL)
+		gve_dma_free_coherent(&priv->counter_array_mem);
+	priv->counter_array_mem = (struct gve_dma_handle){};
 }
 
 static int
@@ -411,12 +429,70 @@ gve_alloc_irq_db_array(struct gve_priv *priv)
 static void
 gve_free_irq_db_array(struct gve_priv *priv)
 {
-	gve_dma_free_coherent(&priv->irqs_db_mem);
-	priv->irqs_db_mem = (struct gve_dma_handle){0};
+	if (priv->irq_db_indices != NULL)
+		gve_dma_free_coherent(&priv->irqs_db_mem);
+	priv->irqs_db_mem = (struct gve_dma_handle){};
+}
+
+static void
+gve_free_rings(struct gve_priv* priv)
+{
+	gve_free_irqs(priv);
+	gve_free_tx_rings(priv);
+	gve_free_rx_rings(priv);
+	gve_free_qpls(priv);
 }
 
 static int
-gve_alloc_and_configure_resources(struct gve_priv *priv)
+gve_alloc_rings(struct gve_priv* priv)
+{
+	int err;
+
+	err = gve_alloc_qpls(priv);
+	if (err != 0)
+		goto abort;
+
+	err = gve_alloc_rx_rings(priv);
+	if (err != 0)
+		goto abort;
+
+	err = gve_alloc_tx_rings(priv);
+	if (err != 0)
+		goto abort;
+
+	err = gve_alloc_irqs(priv);
+	if (err != 0)
+		goto abort;
+
+	return (0);
+
+abort:
+	gve_free_rings(priv);
+	return (err);
+}
+
+static void
+gve_deconfigure_resources(struct gve_priv *priv)
+{
+	int err;
+
+	if (gve_get_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK)) {
+		err = gve_adminq_deconfigure_device_resources(priv);
+		if (err != 0) {
+			device_printf(priv->dev, "Could not deconfigure device resources: err=%d\n",
+			    err);
+			return;
+		}
+		device_printf(priv->dev, "Deconfigured device resources\n");
+		gve_clear_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
+	}
+
+	gve_free_irq_db_array(priv);
+	gve_free_counter_array(priv);
+}
+
+static int
+gve_configure_resources(struct gve_priv *priv)
 {
 	int err;
 
@@ -429,73 +505,23 @@ gve_alloc_and_configure_resources(struct gve_priv *priv)
 
 	err = gve_alloc_irq_db_array(priv);
 	if (err != 0)
-		goto abort_with_counter_array;
-
-	err = gve_alloc_qpls(priv);
-	if (err != 0)
-		goto abort_with_irq_db_array;
-
-	err = gve_alloc_rx_rings(priv);
-	if (err != 0)
-		goto abort_with_qpls;
-
-	err = gve_alloc_tx_rings(priv);
-	if (err != 0)
-		goto abort_with_rx_rings;
-
-	err = gve_alloc_irqs(priv);
-	if (err != 0)
-		goto abort_with_tx_rings;
+		goto abort;
 
 	err = gve_adminq_configure_device_resources(priv);
 	if (err != 0) {
 		device_printf(priv->dev, "Couldn't configure device resources: err=%d\n",
 			      err);
 		err = (ENXIO);
-		goto abort_with_irqs;
+		goto abort;
 	}
 
 	gve_set_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
+	device_printf(priv->dev, "Configured device resources\n");
 	return (0);
 
-abort_with_irqs:
-	gve_free_irqs(priv);
-abort_with_tx_rings:
-	gve_free_tx_rings(priv);
-abort_with_rx_rings:
-	gve_free_rx_rings(priv);
-abort_with_qpls:
-	gve_free_qpls(priv);
-abort_with_irq_db_array:
-	gve_free_irq_db_array(priv);
-abort_with_counter_array:
-	gve_free_counter_array(priv);
+abort:
+	gve_deconfigure_resources(priv);
 	return (err);
-}
-
-static void
-gve_free_and_deconfigure_resources(struct gve_priv *priv)
-{
-	int err;
-
-	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK))
-		return;
-
-	err = gve_adminq_deconfigure_device_resources(priv);
-	if (err != 0) {
-		device_printf(priv->dev, "Could not deconfigure device resources: err=%d\n",
-		    err);
-		return;
-	}
-
-	gve_free_irqs(priv);
-	gve_free_tx_rings(priv);
-	gve_free_rx_rings(priv);
-	gve_free_qpls(priv);
-	gve_free_irq_db_array(priv);
-	gve_free_counter_array(priv);
-
-	gve_clear_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
 }
 
 static void
@@ -528,18 +554,18 @@ gve_alloc_adminq_and_describe_device(struct gve_priv *priv)
 	if ((err = gve_verify_driver_compatibility(priv)) != 0) {
 		device_printf(priv->dev,
 		    "Could not verify driver compatibility: err=%d\n", err);
-		goto abort_with_adminq;
+		goto abort;
 	}
 
 	if ((err = gve_adminq_describe_device(priv)) != 0)
-		goto abort_with_adminq;
+		goto abort;
 
 	gve_set_queue_cnts(priv);
 
 	priv->num_registered_pages = 0;
 	return (0);
 
-abort_with_adminq:
+abort:
 	gve_release_adminq(priv);
 	return (err);
 }
@@ -558,10 +584,8 @@ gve_schedule_reset(struct gve_priv *priv)
 static void
 gve_destroy(struct gve_priv *priv)
 {
-	if_link_state_change(priv->ifp, LINK_STATE_DOWN);
-	gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 	gve_down(priv);
-	gve_free_and_deconfigure_resources(priv);
+	gve_deconfigure_resources(priv);
 	gve_release_adminq(priv);
 }
 
@@ -572,24 +596,20 @@ gve_restore(struct gve_priv *priv)
 
 	err = gve_adminq_alloc(priv);
 	if (err != 0)
-		goto err;
+		goto abort;
 
-	err = gve_alloc_and_configure_resources(priv);
+	err = gve_configure_resources(priv);
 	if (err != 0)
-		goto abort_with_adminq;
+		goto abort;
 
 	err = gve_up(priv);
 	if (err != 0)
-		goto abort_with_resources;
+		goto abort;
 
 	return (0);
 
-abort_with_resources:
-	gve_free_and_deconfigure_resources(priv);
-abort_with_adminq:
-	gve_release_adminq(priv);
-err:
-	device_printf(priv->dev, "Reset failed!\n");
+abort:
+	device_printf(priv->dev, "Restore failed!\n");
 	return (err);
 }
 
@@ -603,12 +623,29 @@ gve_handle_reset(struct gve_priv *priv)
 	gve_set_state_flag(priv, GVE_STATE_FLAG_IN_RESET);
 
 	GVE_GLOBAL_LOCK_LOCK();
-	gve_destroy(priv);
+
+	if_link_state_change(priv->ifp, LINK_STATE_DOWN);
+	gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
+
+	/* Releasing the adminq causes the NIC to destroy all resources
+	 * registered with it, so by clearing the flags beneath we cause
+	 * the subsequent gve_down call below to not attempt to tell the
+	 * NIC to destroy these resources again.
+	 *
+	 * The call to gve_down is needed in the first place to refresh
+	 * the state and the DMA-able memory within each driver ring. */
+	gve_release_adminq(priv);
+	gve_clear_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
+	gve_clear_state_flag(priv, GVE_STATE_FLAG_QPLREG_OK);
+	gve_clear_state_flag(priv, GVE_STATE_FLAG_RX_RINGS_OK);
+	gve_clear_state_flag(priv, GVE_STATE_FLAG_TX_RINGS_OK);
+
+	gve_down(priv);
 	gve_restore(priv);
+
 	GVE_GLOBAL_LOCK_UNLOCK();
 
 	priv->reset_cnt++;
-
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_IN_RESET);
 }
 
@@ -646,26 +683,31 @@ gve_service_task(void *arg, int pending)
 	gve_handle_link_status(priv);
 }
 
-static void
-gve_unregister_device(struct gve_priv *priv)
-{
-	if_t ifp = priv->ifp;
-	if_link_state_change(ifp, LINK_STATE_DOWN);
-	gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
-	if_setdrvflagbits(ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
-	ether_ifdetach(ifp);
-	if_free(ifp);
-}
-
 static int
 gve_probe(device_t dev)
 {
 	if (pci_get_vendor(dev) == PCI_VENDOR_ID_GOOGLE &&
-		pci_get_device(dev) == PCI_DEV_ID_GVNIC) {
-			device_set_desc(dev, "gVNIC");
-			return (BUS_PROBE_DEFAULT);
-		}
+	    pci_get_device(dev) == PCI_DEV_ID_GVNIC) {
+		device_set_desc(dev, "gVNIC");
+		return (BUS_PROBE_DEFAULT);
+	}
 	return (ENXIO);
+}
+
+static void
+gve_free_sys_res_mem(struct gve_priv *priv)
+{
+	if (priv->msix_table != NULL)
+		bus_release_resource(priv->dev,
+		    SYS_RES_MEMORY, rman_get_rid(priv->msix_table), priv->msix_table);
+
+	if (priv->db_bar != NULL)
+		bus_release_resource(
+		    priv->dev, SYS_RES_MEMORY, rman_get_rid(priv->db_bar), priv->db_bar);
+
+	if (priv->reg_bar != NULL)
+		bus_release_resource(
+		    priv->dev, SYS_RES_MEMORY, rman_get_rid(priv->reg_bar), priv->reg_bar);
 }
 
 static int
@@ -687,7 +729,7 @@ gve_attach(device_t dev)
 	if (priv->reg_bar == NULL) {
 		device_printf(dev, "Failed to allocate BAR0\n");
 		err = ENXIO;
-		goto abort_with_lock;
+		goto abort;
 	}
 
 	rid = PCIR_BAR(GVE_DOORBELL_BAR);
@@ -696,7 +738,7 @@ gve_attach(device_t dev)
 	if (priv->db_bar == NULL) {
 		device_printf(dev, "Failed to allocate BAR2\n");
 		err = ENXIO;
-		goto abort_with_reg_bar;
+		goto abort;
 	}
 
 	rid = pci_msix_table_bar(priv->dev);
@@ -705,20 +747,24 @@ gve_attach(device_t dev)
 	if (priv->msix_table == NULL) {
 		device_printf(dev, "Failed to allocate msix table\n");
 		err = ENXIO;
-		goto abort_with_db_bar;
+		goto abort;
 	}
 
 	err = gve_alloc_adminq_and_describe_device(priv);
 	if (err != 0)
-		goto abort_with_msix_table;
+		goto abort;
 
-	err = gve_alloc_and_configure_resources(priv);
+	err = gve_configure_resources(priv);
 	if (err != 0)
-		goto abort_with_adminq;
+		goto abort;
+
+	err = gve_alloc_rings(priv);
+	if (err != 0)
+		goto abort;
 
 	err = gve_setup_ifnet(dev, priv);
 	if (err != 0)
-		goto abort_with_resources;
+		goto abort;
 
 	priv->rx_copybreak = GVE_DEFAULT_RX_COPYBREAK;
 
@@ -737,20 +783,11 @@ gve_attach(device_t dev)
         device_printf(priv->dev, "Successfully attached %s", GVE_DRIVER_VERSION);
 	return (0);
 
-abort_with_resources:
-	gve_free_and_deconfigure_resources(priv);
-abort_with_adminq:
+abort:
+	gve_free_rings(priv);
+	gve_deconfigure_resources(priv);
 	gve_release_adminq(priv);
-abort_with_msix_table:
-	bus_release_resource(
-	    dev, SYS_RES_MEMORY, rman_get_rid(priv->msix_table), priv->msix_table);
-abort_with_db_bar:
-	bus_release_resource(
-	    dev, SYS_RES_MEMORY, rman_get_rid(priv->db_bar), priv->db_bar);
-abort_with_reg_bar:
-	bus_release_resource(
-	    dev, SYS_RES_MEMORY, rman_get_rid(priv->reg_bar), priv->reg_bar);
-abort_with_lock:
+	gve_free_sys_res_mem(priv);
 	GVE_GLOBAL_LOCK_DESTROY();
 	return (err);
 }
@@ -759,26 +796,24 @@ static int
 gve_detach(device_t dev)
 {
 	struct gve_priv *priv = device_get_softc(dev);
+	if_t ifp = priv->ifp;
 
-	gve_unregister_device(priv);
-	gve_down(priv);
-        gve_free_and_deconfigure_resources(priv);
-	gve_release_adminq(priv);
+	ether_ifdetach(ifp);
 
-	bus_release_resource(
-	    dev, SYS_RES_MEMORY, rman_get_rid(priv->msix_table), priv->msix_table);
-	bus_release_resource(
-	    dev, SYS_RES_MEMORY, rman_get_rid(priv->db_bar), priv->db_bar);
-	bus_release_resource(
-	    dev, SYS_RES_MEMORY, rman_get_rid(priv->reg_bar), priv->reg_bar);
+	GVE_GLOBAL_LOCK_LOCK();
+	gve_destroy(priv);
+	GVE_GLOBAL_LOCK_UNLOCK();
 
+	gve_free_rings(priv);
+	gve_free_sys_res_mem(priv);
 	GVE_GLOBAL_LOCK_DESTROY();
 
 	while (taskqueue_cancel(priv->service_tq, &priv->service_task, NULL))
 		taskqueue_drain(priv->service_tq, &priv->service_task);
 	taskqueue_free(priv->service_tq);
 
-	return (0);
+	if_free(ifp);
+	return (bus_generic_detach(dev));
 }
 
 static device_method_t gve_methods[] = {

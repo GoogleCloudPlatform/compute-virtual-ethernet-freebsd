@@ -158,7 +158,7 @@ gve_setup_adminq_stat_sysctl(struct sysctl_ctx_list *ctx,
 	    "adminq_cfg_device_resources_cnt", CTLFLAG_RD,
 	    &priv->adminq_cfg_device_resources_cnt, 0,
 	    "adminq_cfg_device_resources_cnt");
-	SYSCTL_ADD_U32(ctx, admin_list, OID_AUTO, 
+	SYSCTL_ADD_U32(ctx, admin_list, OID_AUTO,
 	    "adminq_register_page_list_cnt", CTLFLAG_RD,
 	    &priv->adminq_register_page_list_cnt, 0,
 	    "adminq_register_page_list_cnt");
@@ -190,12 +190,6 @@ gve_setup_adminq_stat_sysctl(struct sysctl_ctx_list *ctx,
 	    "adminq_verify_driver_compatibility_cnt", CTLFLAG_RD,
 	    &priv->adminq_verify_driver_compatibility_cnt, 0,
 	    "adminq_verify_driver_compatibility_cnt");
-	SYSCTL_ADD_U32(ctx, admin_list, OID_AUTO, "adminq_report_stats_cnt",
-	    CTLFLAG_RD, &priv->adminq_report_stats_cnt, 0,
-	    "adminq_report_stats_cnt");
-	SYSCTL_ADD_U32(ctx, admin_list, OID_AUTO, "adminq_report_link_speed_cnt",
-	    CTLFLAG_RD, &priv->adminq_report_link_speed_cnt, 0,
-	    "adminq_report_link_speed_cnt");
 }
 
 void gve_setup_sysctl(struct gve_priv *priv)
@@ -219,18 +213,18 @@ gve_accum_stats(struct gve_priv *priv, uint64_t *rpackets,
     uint64_t *rbytes, uint64_t *rx_dropped_pkt, uint64_t *tpackets,
     uint64_t *tbytes, uint64_t *tx_dropped_pkt)
 {
-	for (int i = 0; i < priv->rx_cfg.num_queues; i++) {
-		struct gve_rxq_stats *rxqstats;
+	struct gve_rxq_stats *rxqstats;
+	struct gve_txq_stats *txqstats;
+	int i;
 
+	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
 		rxqstats = &priv->rx[i].stats;
 		*rpackets += counter_u64_fetch(rxqstats->rpackets);
 		*rbytes += counter_u64_fetch(rxqstats->rbytes);
 		*rx_dropped_pkt += counter_u64_fetch(rxqstats->rx_dropped_pkt);
 	}
 
-	for (int i = 0; i < priv->tx_cfg.num_queues; i++) {
-		struct gve_txq_stats *txqstats;
-
+	for (i = 0; i < priv->tx_cfg.num_queues; i++) {
 		txqstats = &priv->tx[i].stats;
 		*tpackets += counter_u64_fetch(txqstats->tpackets);
 		*tbytes += counter_u64_fetch(txqstats->tbytes);

@@ -31,6 +31,39 @@
 #include "gve.h"
 #include "gve_adminq.h"
 
+static void
+gve_rx_free_ring(struct gve_priv *priv, int i)
+{
+	struct gve_rx_ring *rx = &priv->rx[i];
+	struct gve_ring_com *com = &rx->com;
+
+        /* Safe to call even if never allocated */
+	gve_free_counters((counter_u64_t *)&rx->stats, NUM_RX_STATS);
+
+	if (rx->page_info != NULL) {
+		free(rx->page_info, M_GVE);
+		rx->page_info = NULL;
+	}
+
+	if (rx->data_ring != NULL) {
+		gve_dma_free_coherent(&rx->data_ring_mem);
+		rx->data_ring = NULL;
+	}
+
+	if (rx->desc_ring != NULL) {
+		gve_dma_free_coherent(&rx->desc_ring_mem);
+		rx->desc_ring = NULL;
+	}
+
+	if (com->q_resources != NULL) {
+		gve_dma_free_coherent(&com->q_resources_mem);
+		com->q_resources = NULL;
+	}
+
+        /* Safe to call even if never assigned */
+	gve_unassign_qpl(priv, com->qpl->id);
+}
+
 static int
 gve_rx_alloc_ring(struct gve_priv *priv, int i)
 {
@@ -49,12 +82,22 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 		return (ENOMEM);
 	}
 
+	rx->page_info = malloc(priv->rx_desc_cnt * sizeof(*rx->page_info), M_GVE,
+			    M_WAITOK | M_ZERO);
+	if (rx->page_info == NULL) {
+		device_printf(priv->dev, "Cannot alloc page_info for rx ring %d", i);
+		err = (ENOMEM);
+		goto abort;
+	}
+
+	gve_alloc_counters((counter_u64_t *)&rx->stats, NUM_RX_STATS);
+
 	err = gve_dma_alloc_coherent(priv, sizeof(struct gve_queue_resources),
-	          PAGE_SIZE, &com->q_resources_mem,
+		  PAGE_SIZE, &com->q_resources_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
 		device_printf(priv->dev, "Cannot alloc queue resources for rx ring %d", i);
-		goto abort_with_qpl;
+		goto abort;
 	}
 	com->q_resources = com->q_resources_mem.cpu_addr;
 
@@ -64,7 +107,7 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
 		device_printf(priv->dev, "Cannot alloc desc ring for rx ring %d", i);
-		goto abort_with_q_resources;
+		goto abort;
 	}
 	rx->desc_ring = rx->desc_ring_mem.cpu_addr;
 
@@ -74,59 +117,15 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
 		device_printf(priv->dev, "Cannot alloc data ring for rx ring %d", i);
-		goto abort_with_desc_ring;
+		goto abort;
 	}
 	rx->data_ring = rx->data_ring_mem.cpu_addr;
 
-	rx->page_info = malloc(priv->rx_desc_cnt * sizeof(*rx->page_info), M_GVE,
-			    M_WAITOK | M_ZERO);
-	if (rx->page_info == NULL) {
-		err = (ENOMEM);
-		goto abort_with_data_ring;
-	}
-
-	gve_prefill_rx_slots(rx);
-	gve_alloc_counters((counter_u64_t *)&rx->stats, NUM_RX_STATS);
-
-	rx->cnt = 0;
-	rx->seq_no = 1;
 	return (0);
 
-abort_with_data_ring:
-	gve_dma_free_coherent(&rx->data_ring_mem);
-	rx->data_ring = NULL;
-abort_with_desc_ring:
-	gve_dma_free_coherent(&rx->desc_ring_mem);
-	rx->desc_ring = NULL;
-abort_with_q_resources:
-	gve_dma_free_coherent(&com->q_resources_mem);
-	com->q_resources = NULL;
-abort_with_qpl:
-	gve_unassign_qpl(priv, com->qpl->id);
+abort:
+	gve_rx_free_ring(priv, i);
 	return (err);
-}
-
-static void
-gve_rx_free_ring(struct gve_priv *priv, int i)
-{
-	struct gve_rx_ring *rx = &priv->rx[i];
-	struct gve_ring_com *com = &rx->com;
-
-	gve_free_counters((counter_u64_t *)&rx->stats, NUM_RX_STATS);
-
-	free(rx->page_info, M_GVE);
-	rx->page_info = NULL;
-
-	gve_dma_free_coherent(&rx->data_ring_mem);
-	rx->data_ring = NULL;
-
-	gve_dma_free_coherent(&rx->desc_ring_mem);
-	rx->desc_ring = NULL;
-
-	gve_dma_free_coherent(&com->q_resources_mem);
-	com->q_resources = NULL;
-
-	gve_unassign_qpl(priv, com->qpl->id);
 }
 
 int
@@ -154,9 +153,8 @@ gve_alloc_rx_rings(struct gve_priv *priv)
 	return (0);
 
 free_rings:
-	while (i--) {
+	while (i--)
 		gve_rx_free_ring(priv, i);
-	}
 	free(priv->rx, M_GVE);
 	return (err);
 }
@@ -170,6 +168,56 @@ gve_free_rx_rings(struct gve_priv *priv)
 		gve_rx_free_ring(priv, i);
 
 	free(priv->rx, M_GVE);
+}
+
+static void
+gve_rx_clear_desc_ring(struct gve_rx_ring *rx)
+{
+	struct gve_ring_com *com = &rx->com;
+	int i;
+
+	for (i = 0; i < com->priv->rx_desc_cnt; i++)
+		rx->desc_ring[i] = (struct gve_rx_desc){};
+
+	bus_dmamap_sync(rx->desc_ring_mem.tag, rx->desc_ring_mem.map,
+	    BUS_DMASYNC_PREWRITE);
+}
+
+static void
+gve_prefill_rx_slots(struct gve_rx_ring *rx)
+{
+	struct gve_ring_com *com = &rx->com;
+	struct gve_dma_handle *dma;
+	int i;
+
+	for (i = 0; i < com->priv->rx_desc_cnt; i++) {
+		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i);
+		rx->fill_cnt++;
+
+		rx->page_info[i].page_offset = 0;
+		rx->page_info[i].page_address = com->qpl->dmas[i].cpu_addr;
+		rx->page_info[i].can_flip = true;
+
+		dma = &com->qpl->dmas[i];
+		bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_PREREAD);
+	}
+
+	bus_dmamap_sync(rx->data_ring_mem.tag, rx->data_ring_mem.map,
+	    BUS_DMASYNC_PREWRITE);
+}
+
+static void
+gve_clear_rx_ring(struct gve_priv *priv, int i)
+{
+	struct gve_rx_ring *rx = &priv->rx[i];
+
+	rx->seq_no = 1;
+	rx->cnt = 0;
+	rx->fill_cnt = 0;
+	rx->mask = priv->rx_desc_cnt - 1;
+
+	gve_prefill_rx_slots(rx);
+	gve_rx_clear_desc_ring(rx);
 }
 
 static void
@@ -187,11 +235,9 @@ gve_start_rx_ring(struct gve_priv *priv, int i)
 	NET_TASK_INIT(&com->cleanup_task, 0, gve_rx_cleanup_tq, rx);
 	com->cleanup_tq = taskqueue_create_fast("gve rx", M_WAITOK,
 			      taskqueue_thread_enqueue, &com->cleanup_tq);
+
 	taskqueue_start_threads(&com->cleanup_tq, 1, PI_NET,
 	    "%s rxq %d", device_get_nameunit(priv->dev), i);
-
-	bus_dmamap_sync(rx->desc_ring_mem.tag, rx->desc_ring_mem.map,
-	    BUS_DMASYNC_PREREAD);
 
 	gve_db_bar_write_4(priv, com->db_offset, rx->fill_cnt);
 }
@@ -206,6 +252,9 @@ gve_create_rx_rings(struct gve_priv *priv)
 
 	if (gve_get_state_flag(priv, GVE_STATE_FLAG_RX_RINGS_OK))
 		return (0);
+
+	for (i = 0; i < priv->rx_cfg.num_queues; i++)
+		gve_clear_rx_ring(priv, i);
 
 	err = gve_adminq_create_rx_queues(priv, priv->rx_cfg.num_queues);
 	if (err != 0)
@@ -238,11 +287,12 @@ gve_stop_rx_ring(struct gve_priv *priv, int i)
 	struct gve_rx_ring *rx = &priv->rx[i];
 	struct gve_ring_com *com = &rx->com;
 
-	tcp_lro_free(&rx->lro);
-
 	while (taskqueue_cancel(com->cleanup_tq, &com->cleanup_task, NULL))
 		taskqueue_drain(com->cleanup_tq, &com->cleanup_task);
 	taskqueue_free(com->cleanup_tq);
+
+	tcp_lro_free(&rx->lro);
+	rx->ctx = (struct gve_rx_ctx){};
 }
 
 int
@@ -251,41 +301,17 @@ gve_destroy_rx_rings(struct gve_priv *priv)
 	int err;
 	int i;
 
-	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_RX_RINGS_OK))
-		return (0);
-
 	for (i = 0; i < priv->rx_cfg.num_queues; i++)
 		gve_stop_rx_ring(priv, i);
 
-	err = gve_adminq_destroy_rx_queues(priv, priv->rx_cfg.num_queues);
-	if (err != 0)
-		return (err);
-
-	gve_clear_state_flag(priv, GVE_STATE_FLAG_RX_RINGS_OK);
-	return (0);
-}
-
-void
-gve_prefill_rx_slots(struct gve_rx_ring *rx)
-{
-	struct gve_ring_com *com = &rx->com;
-	struct gve_dma_handle *dma;
-	int i;
-
-	for (i = 0; i < com->priv->rx_desc_cnt; i++) {
-		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i);
-		rx->fill_cnt++;
-
-		rx->page_info[i].page_offset = 0;
-		rx->page_info[i].page_address = com->qpl->dmas[i].cpu_addr;
-		rx->page_info[i].can_flip = true;
-
-		dma = &com->qpl->dmas[i];
-		bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_PREREAD);
+	if (gve_get_state_flag(priv, GVE_STATE_FLAG_RX_RINGS_OK)) {
+		err = gve_adminq_destroy_rx_queues(priv, priv->rx_cfg.num_queues);
+		if (err != 0)
+			return (err);
+		gve_clear_state_flag(priv, GVE_STATE_FLAG_RX_RINGS_OK);
 	}
 
-	bus_dmamap_sync(rx->data_ring_mem.tag, rx->data_ring_mem.map,
-	    BUS_DMASYNC_PREWRITE);
+	return (0);
 }
 
 static void
@@ -428,11 +454,11 @@ gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
 }
 
 static void
-gve_rx(struct gve_rx_ring *rx, struct gve_rx_desc *desc, uint32_t idx)
+gve_rx(struct gve_priv *priv, struct gve_rx_ring *rx, struct gve_rx_desc *desc,
+    uint32_t idx)
 {
 	struct gve_rx_slot_page_info *page_info;
 	struct gve_dma_handle *page_dma_handle;
-	struct gve_priv *priv = rx->com.priv;
 	union gve_rx_data_slot *data_slot;
 	struct gve_rx_ctx *ctx = &rx->ctx;
 	struct mbuf *mbuf = NULL;
@@ -555,10 +581,10 @@ gve_rx_cleanup(struct gve_priv *priv, struct gve_rx_ring *rx, int budget)
 	    BUS_DMASYNC_POSTREAD);
 	desc = &rx->desc_ring[idx];
 
-	while ((GVE_SEQNO(desc->flags_seq) == rx->seq_no) &&
-	       (work_done < budget || ctx->frag_cnt)) {
+	while ((work_done < budget || ctx->frag_cnt) &&
+	    (GVE_SEQNO(desc->flags_seq) == rx->seq_no)) {
 
-		gve_rx(rx, desc, idx);
+		gve_rx(priv, rx, desc, idx);
 
 		rx->cnt++;
 		idx = rx->cnt & rx->mask;

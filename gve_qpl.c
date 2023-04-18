@@ -71,7 +71,7 @@ struct gve_queue_page_list *
 gve_assign_rx_qpl(struct gve_priv *priv)
 {
 	int id = find_next_zero_bit(priv->qpl_cfg.qpl_id_map,
-		     priv->qpl_cfg.qpl_map_size, gve_num_tx_qpls(priv));
+	    priv->qpl_cfg.qpl_map_size, gve_num_tx_qpls(priv));
 
 	/* we are out of rx qpls */
 	if (id == gve_num_tx_qpls(priv) + gve_num_rx_qpls(priv))
@@ -87,10 +87,30 @@ gve_unassign_qpl(struct gve_priv *priv, int id)
 	clear_bit(id, priv->qpl_cfg.qpl_id_map);
 }
 
+static void
+gve_free_qpl(struct gve_priv *priv, uint32_t id)
+{
+	struct gve_queue_page_list *qpl = &priv->qpls[id];
+	int i;
+
+	if (qpl->dmas != NULL && qpl->pages != NULL) {
+		for (i = 0; i < qpl->num_entries; i++) {
+			if (qpl->pages[i] != NULL) {
+				gve_dma_free_coherent(&qpl->dmas[i]);
+				priv->num_registered_pages--;
+			}
+		}
+	}
+
+	if (qpl->pages != NULL)
+		free(qpl->pages, M_GVE_QPL);
+
+	if (qpl->dmas != NULL)
+		free(qpl->dmas, M_GVE_QPL);
+}
 
 static int
-gve_alloc_queue_page_list(struct gve_priv *priv, uint32_t id,
-    int pages)
+gve_alloc_qpl(struct gve_priv *priv, uint32_t id, int pages)
 {
 	struct gve_queue_page_list *qpl = &priv->qpls[id];
 	int err;
@@ -115,7 +135,7 @@ gve_alloc_queue_page_list(struct gve_priv *priv, uint32_t id,
 			 M_WAITOK | M_ZERO);
 	if (qpl->pages == NULL) {
 		err = ENOMEM;
-		goto abort_with_dmas_malloc;
+		goto abort;
 	}
 
 	for (i = 0; i < pages; i++) {
@@ -124,41 +144,37 @@ gve_alloc_queue_page_list(struct gve_priv *priv, uint32_t id,
 		if (err != 0) {
 			device_printf(priv->dev, "Cannot allocate QPL page\n");
 			err = ENOMEM;
-			goto abort_with_dmas;
+			goto abort;
 		}
 		qpl->pages[i] = virt_to_page(qpl->dmas[i].cpu_addr);
 		qpl->num_entries++;
+		priv->num_registered_pages++;
 	}
 
-	priv->num_registered_pages += pages;
 	return (0);
 
-abort_with_dmas:
-	while (i--) {
-		gve_dma_free_coherent(&qpl->dmas[i]);
-		priv->num_registered_pages--;
-	}
-	free(qpl->pages, M_GVE_QPL);
-abort_with_dmas_malloc:
-	free(qpl->dmas, M_GVE_QPL);
+abort:
+	gve_free_qpl(priv, id);
 	return (err);
 }
 
-static void
-gve_free_queue_page_list(struct gve_priv *priv, uint32_t id)
+void
+gve_free_qpls(struct gve_priv *priv)
 {
-	struct gve_queue_page_list *qpl = &priv->qpls[id];
+	int num_qpls = gve_num_tx_qpls(priv) + gve_num_rx_qpls(priv);
 	int i;
 
-	if (qpl->dmas == NULL)
+	if (num_qpls == 0)
 		return;
 
-	for (i = 0; i < qpl->num_entries; i++) {
-		gve_dma_free_coherent(&qpl->dmas[i]);
-		priv->num_registered_pages--;
+	if (priv->qpls != NULL) {
+		for (i = 0; i < num_qpls; i++)
+			gve_free_qpl(priv, i);
+		free(priv->qpls, M_GVE_QPL);
 	}
-	free(qpl->dmas, M_GVE_QPL);
-	free(qpl->pages, M_GVE_QPL);
+
+	if (priv->qpl_cfg.qpl_id_map != NULL)
+		free(priv->qpl_cfg.qpl_id_map, M_GVE_QPL);
 }
 
 int gve_alloc_qpls(struct gve_priv *priv)
@@ -176,51 +192,53 @@ int gve_alloc_qpls(struct gve_priv *priv)
 		return (ENOMEM);
 
 	for (i = 0; i < gve_num_tx_qpls(priv); i++) {
-		err = gve_alloc_queue_page_list(priv, i, priv->tx_desc_cnt / GVE_QPL_DIVISOR);
+		err = gve_alloc_qpl(priv, i, priv->tx_desc_cnt / GVE_QPL_DIVISOR);
 		if (err != 0)
-			goto free_qpls;
+			goto abort;
 	}
 
 	for (; i < num_qpls; i++) {
-		err = gve_alloc_queue_page_list(priv, i, priv->rx_desc_cnt);
+		err = gve_alloc_qpl(priv, i, priv->rx_desc_cnt);
 		if (err != 0)
-			goto free_qpls;
+			goto abort;
 	}
 
 	priv->qpl_cfg.qpl_map_size = BITS_TO_LONGS(num_qpls) *
-				         sizeof(unsigned long) * BITS_PER_BYTE;
+				     sizeof(unsigned long) * BITS_PER_BYTE;
 	priv->qpl_cfg.qpl_id_map = malloc(BITS_TO_LONGS(num_qpls) *
-				       sizeof(unsigned long), M_GVE_QPL,
-				       M_WAITOK | M_ZERO);
+					  sizeof(unsigned long), M_GVE_QPL,
+					  M_WAITOK | M_ZERO);
 	if (priv->qpl_cfg.qpl_id_map == 0) {
 		err = ENOMEM;
-		goto free_qpls;
+		goto abort;
 	}
 
 	return (0);
 
-free_qpls:
-	while (i--)
-		gve_free_queue_page_list(priv, i);
-	free(priv->qpls, M_GVE_QPL);
+abort:
+	gve_free_qpls(priv);
 	return (err);
 }
 
-void
-gve_free_qpls(struct gve_priv *priv)
+static int
+gve_unregister_n_qpls(struct gve_priv *priv, int n)
 {
-	int num_qpls = gve_num_tx_qpls(priv) + gve_num_rx_qpls(priv);
+	int err;
 	int i;
 
-	if (num_qpls == 0)
-		return;
+	for (i = 0; i < n; i++) {
+		err = gve_adminq_unregister_page_list(priv, priv->qpls[i].id);
+		if (err != 0) {
+			device_printf(priv->dev,
+			    "Failed to unregister qpl %d, err: %d\n",
+			    priv->qpls[i].id, err);
+		}
+	}
 
-	free(priv->qpl_cfg.qpl_id_map, M_GVE_QPL);
+	if (err != 0)
+		return (err);
 
-	for (i = 0; i < num_qpls; i++)
-		gve_free_queue_page_list(priv, i);
-
-	free(priv->qpls, M_GVE_QPL);
+	return (0);
 }
 
 int
@@ -237,35 +255,32 @@ gve_register_qpls(struct gve_priv *priv)
 		err = gve_adminq_register_page_list(priv, &priv->qpls[i]);
 		if (err != 0) {
 			device_printf(priv->dev,
-			    "failed to register queue page list %d\n",
-			    priv->qpls[i].id);
-			return (err);
+			    "Failed to register qpl %d, err: %d\n",
+			    priv->qpls[i].id, err);
+			goto abort;
 		}
 	}
 
 	gve_set_state_flag(priv, GVE_STATE_FLAG_QPLREG_OK);
 	return (0);
+
+abort:
+	gve_unregister_n_qpls(priv, i);
+	return (err);
 }
 
 int
 gve_unregister_qpls(struct gve_priv *priv)
 {
 	int num_qpls = gve_num_tx_qpls(priv) + gve_num_rx_qpls(priv);
-	int err ;
-	int i;
+	int err;
 
 	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_QPLREG_OK))
 		return (0);
 
-	for (i = 0; i < num_qpls; i++) {
-		err = gve_adminq_unregister_page_list(priv, priv->qpls[i].id);
-		if (err != 0) {
-			device_printf(priv->dev,
-			    "Failed to unregister queue page list %d\n",
-			    priv->qpls[i].id);
-			return (err);
-		}
-	}
+	err = gve_unregister_n_qpls(priv, num_qpls);
+	if (err != 0)
+		return (err);
 
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_QPLREG_OK);
 	return (0);

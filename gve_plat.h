@@ -109,8 +109,4 @@
       [!!sizeof (struct { int __error_if_negative: (expr) ? 2 : -1; })]
 #define static_assert(expr, ...) _Static_assert(expr, #expr)
 
-#define IF_BAD_DMA (bus_addr_t) - 1
-
-#define ETH_MIN_MTU	68 /* Min IPv4 MTU per RFC791	*/
-
 #endif  // _GVE_PLAT_FBSD_H

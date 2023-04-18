@@ -151,14 +151,6 @@ struct gve_device_option_jumbo_frames {
 
 static_assert(sizeof(struct gve_device_option_jumbo_frames) == 8);
 
-/* Terminology:
- *
- * RDA - Raw DMA Addressing - Buffers associated with SKBs are directly DMA
- *	 mapped and read/updated by the device.
- *
- * QPL - Queue Page Lists - Driver uses bounce buffers which are DMA mapped with
- *	 the device for read/write and data is copied from/to SKBs.
- */
 enum gve_dev_opt_id {
 	GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING = 0x1,
 	GVE_DEV_OPT_ID_GQI_RDA = 0x2,
@@ -168,6 +160,10 @@ enum gve_dev_opt_id {
 	GVE_DEV_OPT_ID_JUMBO_FRAMES = 0x8,
 };
 
+/* These masks are way to predicate the use of a particular option on the driver
+ * having particular bug fixes represented by each bit position in the mask.
+ * Currently they are all zero because there are no known bugs preventing the
+ * use of any option. */
 enum gve_dev_opt_req_feat_mask {
 	GVE_DEV_OPT_REQ_FEAT_MASK_GQI_RAW_ADDRESSING = 0x0,
 	GVE_DEV_OPT_REQ_FEAT_MASK_GQI_RDA = 0x0,
@@ -182,11 +178,9 @@ enum gve_sup_feature_mask {
 	GVE_SUP_JUMBO_FRAMES_MASK = 1 << 2,
 };
 
-#define GVE_DEV_OPT_LEN_GQI_RAW_ADDRESSING 0x0
-
 #define GVE_VERSION_STR_LEN 128
 
-enum gve_driver_capbility {
+enum gve_driver_capability {
 	gve_driver_capability_gqi_qpl = 0,
 	gve_driver_capability_gqi_rda = 1,
 	gve_driver_capability_dqo_qpl = 2, /* reserved for future use */
@@ -199,9 +193,10 @@ enum gve_driver_capbility {
 #define GVE_CAP3(a) BIT(((int) a) - 128)
 #define GVE_CAP4(a) BIT(((int) a) - 192)
 
-#define GVE_DRIVER_CAPABILITY_FLAGS1 \
-    (GVE_CAP1(gve_driver_capability_gqi_qpl))
-
+/* The following four defines describe 256 compatibility bits.
+ * Only a few bits (as shown in `gve_driver_compatibility`) are currently
+ * defined. The rest are reserved for future use. */
+#define GVE_DRIVER_CAPABILITY_FLAGS1 (GVE_CAP1(gve_driver_capability_gqi_qpl))
 #define GVE_DRIVER_CAPABILITY_FLAGS2 0x0
 #define GVE_DRIVER_CAPABILITY_FLAGS3 0x0
 #define GVE_DRIVER_CAPABILITY_FLAGS4 0x0
@@ -253,8 +248,6 @@ struct gve_adminq_unregister_page_list {
 };
 
 static_assert(sizeof(struct gve_adminq_unregister_page_list) == 4);
-
-#define GVE_RAW_ADDRESSING_QPL_ID 0xFFFFFFFF
 
 struct gve_adminq_create_tx_queue {
 	__be32 queue_id;
@@ -327,20 +320,6 @@ struct gve_adminq_set_driver_parameter {
 
 static_assert(sizeof(struct gve_adminq_set_driver_parameter) == 16);
 
-struct gve_adminq_report_stats {
-	__be64 stats_report_len;
-	__be64 stats_report_addr;
-	__be64 interval;
-};
-
-static_assert(sizeof(struct gve_adminq_report_stats) == 24);
-
-struct gve_adminq_report_link_speed {
-	__be64 link_speed_address;
-};
-
-static_assert(sizeof(struct gve_adminq_report_link_speed) == 8);
-
 struct stats {
 	__be32 stat_name;
 	__be32 queue_id;
@@ -349,91 +328,27 @@ struct stats {
 
 static_assert(sizeof(struct stats) == 16);
 
-struct gve_stats_report {
-	__be64 written_count;
-	struct stats stats[];
-};
-
-static_assert(sizeof(struct gve_stats_report) == 8);
-
-enum gve_stat_names {
-	/* stats from gve */
-	TX_WAKE_CNT			= 1,
-	TX_STOP_CNT			= 2,
-	TX_FRAMES_SENT			= 3,
-	TX_BYTES_SENT			= 4,
-	TX_LAST_COMPLETION_PROCESSED	= 5,
-	RX_NEXT_EXPECTED_SEQUENCE	= 6,
-	RX_BUFFERS_POSTED		= 7,
-	TX_TIMEOUT_CNT			= 8,
-	/* stats from NIC */
-	RX_QUEUE_DROP_CNT		= 65,
-	RX_NO_BUFFERS_POSTED		= 66,
-	RX_DROPS_PACKET_OVER_MRU	= 67,
-	RX_DROPS_INVALID_CHECKSUM	= 68,
-};
-
-enum gve_l3_type {
-	/* Must be zero so zero initialized LUT is unknown. */
-	GVE_L3_TYPE_UNKNOWN = 0,
-	GVE_L3_TYPE_OTHER,
-	GVE_L3_TYPE_IPV4,
-	GVE_L3_TYPE_IPV6,
-};
-
-enum gve_l4_type {
-	/* Must be zero so zero initialized LUT is unknown. */
-	GVE_L4_TYPE_UNKNOWN = 0,
-	GVE_L4_TYPE_OTHER,
-	GVE_L4_TYPE_TCP,
-	GVE_L4_TYPE_UDP,
-	GVE_L4_TYPE_ICMP,
-	GVE_L4_TYPE_SCTP,
-};
-
-/* These are control path types for PTYPE which are the same as the data path
- * types.
- */
-struct gve_ptype_entry {
-	uint8_t l3_type;
-	uint8_t l4_type;
-};
-
-struct gve_ptype_map {
-	struct gve_ptype_entry ptypes[1 << 10]; /* PTYPES are always 10 bits. */
-};
-
-struct gve_adminq_get_ptype_map {
-	__be64 ptype_map_len;
-	__be64 ptype_map_addr;
-};
-
-union gve_adminq_command {
-	struct {
-		__be32 opcode;
-		__be32 status;
-		union {
-			struct gve_adminq_configure_device_resources
-						configure_device_resources;
-			struct gve_adminq_create_tx_queue create_tx_queue;
-			struct gve_adminq_create_rx_queue create_rx_queue;
-			struct gve_adminq_destroy_tx_queue destroy_tx_queue;
-			struct gve_adminq_destroy_rx_queue destroy_rx_queue;
-			struct gve_adminq_describe_device describe_device;
-			struct gve_adminq_register_page_list reg_page_list;
-			struct gve_adminq_unregister_page_list unreg_page_list;
-			struct gve_adminq_set_driver_parameter set_driver_param;
-			struct gve_adminq_report_stats report_stats;
-			struct gve_adminq_report_link_speed report_link_speed;
-			struct gve_adminq_get_ptype_map get_ptype_map;
-			struct gve_adminq_verify_driver_compatibility
-						verify_driver_compatibility;
-		};
+struct gve_adminq_command {
+	__be32 opcode;
+	__be32 status;
+	union {
+		struct gve_adminq_configure_device_resources
+					configure_device_resources;
+		struct gve_adminq_create_tx_queue create_tx_queue;
+		struct gve_adminq_create_rx_queue create_rx_queue;
+		struct gve_adminq_destroy_tx_queue destroy_tx_queue;
+		struct gve_adminq_destroy_rx_queue destroy_rx_queue;
+		struct gve_adminq_describe_device describe_device;
+		struct gve_adminq_register_page_list reg_page_list;
+		struct gve_adminq_unregister_page_list unreg_page_list;
+		struct gve_adminq_set_driver_parameter set_driver_param;
+		struct gve_adminq_verify_driver_compatibility
+					verify_driver_compatibility;
+		uint8_t reserved[56];
 	};
-	uint8_t reserved[64];
 };
 
-static_assert(sizeof(union gve_adminq_command) == 64);
+static_assert(sizeof(struct gve_adminq_command) == 64);
 
 int gve_adminq_create_rx_queues(struct gve_priv *priv, uint32_t num_queues);
 int gve_adminq_create_tx_queues(struct gve_priv *priv, uint32_t num_queues);
