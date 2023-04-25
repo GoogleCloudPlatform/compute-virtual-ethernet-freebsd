@@ -64,6 +64,27 @@ gve_rx_free_ring(struct gve_priv *priv, int i)
 	gve_unassign_qpl(priv, com->qpl->id);
 }
 
+static void
+gve_prefill_rx_slots(struct gve_rx_ring *rx)
+{
+	struct gve_ring_com *com = &rx->com;
+	struct gve_dma_handle *dma;
+	int i;
+
+	for (i = 0; i < com->priv->rx_desc_cnt; i++) {
+		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i);
+		rx->page_info[i].page_offset = 0;
+		rx->page_info[i].page_address = com->qpl->dmas[i].cpu_addr;
+		rx->page_info[i].can_flip = true;
+
+		dma = &com->qpl->dmas[i];
+		bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_PREREAD);
+	}
+
+	bus_dmamap_sync(rx->data_ring_mem.tag, rx->data_ring_mem.map,
+	    BUS_DMASYNC_PREWRITE);
+}
+
 static int
 gve_rx_alloc_ring(struct gve_priv *priv, int i)
 {
@@ -121,6 +142,7 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 	}
 	rx->data_ring = rx->data_ring_mem.cpu_addr;
 
+	gve_prefill_rx_slots(rx);
 	return (0);
 
 abort:
@@ -171,38 +193,39 @@ gve_free_rx_rings(struct gve_priv *priv)
 }
 
 static void
-gve_rx_clear_desc_ring(struct gve_rx_ring *rx)
+gve_rx_clear_data_ring(struct gve_rx_ring *rx)
 {
-	struct gve_ring_com *com = &rx->com;
+	struct gve_priv *priv = rx->com.priv;
 	int i;
 
-	for (i = 0; i < com->priv->rx_desc_cnt; i++)
-		rx->desc_ring[i] = (struct gve_rx_desc){};
+	/* The Rx data ring has this invariant: "the networking stack is not
+	 * using the buffer beginning at any page_offset". This invariant is
+	 * established initially by gve_prefill_rx_slots at alloc-time and is
+	 * maintained by the cleanup taskqueue. This invariant implies that the
+	 * ring can be considered to be fully posted with buffers at this point,
+	 * even if there are unfreed mbufs still being processed, which is why we
+	 * can fill the ring without waiting on can_flip at each slot to become true.
+	 * */
+	for (i = 0; i < priv->rx_desc_cnt; i++) {
+		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i +
+		    rx->page_info[i].page_offset);
+		rx->fill_cnt++;
+	}
 
-	bus_dmamap_sync(rx->desc_ring_mem.tag, rx->desc_ring_mem.map,
+	bus_dmamap_sync(rx->data_ring_mem.tag, rx->data_ring_mem.map,
 	    BUS_DMASYNC_PREWRITE);
 }
 
 static void
-gve_prefill_rx_slots(struct gve_rx_ring *rx)
+gve_rx_clear_desc_ring(struct gve_rx_ring *rx)
 {
-	struct gve_ring_com *com = &rx->com;
-	struct gve_dma_handle *dma;
+	struct gve_priv *priv = rx->com.priv;
 	int i;
 
-	for (i = 0; i < com->priv->rx_desc_cnt; i++) {
-		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i);
-		rx->fill_cnt++;
+	for (i = 0; i < priv->rx_desc_cnt; i++)
+		rx->desc_ring[i] = (struct gve_rx_desc){};
 
-		rx->page_info[i].page_offset = 0;
-		rx->page_info[i].page_address = com->qpl->dmas[i].cpu_addr;
-		rx->page_info[i].can_flip = true;
-
-		dma = &com->qpl->dmas[i];
-		bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_PREREAD);
-	}
-
-	bus_dmamap_sync(rx->data_ring_mem.tag, rx->data_ring_mem.map,
+	bus_dmamap_sync(rx->desc_ring_mem.tag, rx->desc_ring_mem.map,
 	    BUS_DMASYNC_PREWRITE);
 }
 
@@ -216,8 +239,8 @@ gve_clear_rx_ring(struct gve_priv *priv, int i)
 	rx->fill_cnt = 0;
 	rx->mask = priv->rx_desc_cnt - 1;
 
-	gve_prefill_rx_slots(rx);
 	gve_rx_clear_desc_ring(rx);
+	gve_rx_clear_data_ring(rx);
 }
 
 static void
@@ -287,9 +310,11 @@ gve_stop_rx_ring(struct gve_priv *priv, int i)
 	struct gve_rx_ring *rx = &priv->rx[i];
 	struct gve_ring_com *com = &rx->com;
 
-	while (taskqueue_cancel(com->cleanup_tq, &com->cleanup_task, NULL))
-		taskqueue_drain(com->cleanup_tq, &com->cleanup_task);
-	taskqueue_free(com->cleanup_tq);
+	if (com->cleanup_tq != NULL) {
+		taskqueue_quiesce(com->cleanup_tq);
+		taskqueue_free(com->cleanup_tq);
+		com->cleanup_tq = NULL;
+	}
 
 	tcp_lro_free(&rx->lro);
 	rx->ctx = (struct gve_rx_ctx){};
@@ -312,16 +337,6 @@ gve_destroy_rx_rings(struct gve_priv *priv)
 	}
 
 	return (0);
-}
-
-static void
-gve_rx_ctx_clear(struct gve_rx_ctx *ctx)
-{
-	ctx->mbuf_head = NULL;
-	ctx->mbuf_tail = NULL;
-	ctx->total_size = 0;
-	ctx->frag_cnt = 0;
-	ctx->drop_pkt = false;
 }
 
 int
@@ -431,7 +446,7 @@ gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
 
 		if (page_info->can_flip) {
 			MEXTADD(mbuf, va, len, gve_mextadd_free,
-			    page_info, NULL, M_RDONLY, EXT_NET_DRV);
+			    page_info, NULL, 0, EXT_NET_DRV);
 
 			counter_enter();
 			counter_u64_add_protected(rx->stats.rx_frag_flip_cnt, 1);
@@ -548,8 +563,7 @@ gve_rx(struct gve_priv *priv, struct gve_rx_ring *rx, struct gve_rx_desc *desc,
 finish_frag:
 	ctx->frag_cnt++;
 	if (is_last_frag)
-		gve_rx_ctx_clear(ctx);
-
+		rx->ctx = (struct gve_rx_ctx){};
 }
 
 static bool
@@ -596,7 +610,7 @@ gve_rx_cleanup(struct gve_priv *priv, struct gve_rx_ring *rx, int budget)
 	/* The device will only send whole packets. */
 	if (unlikely(ctx->frag_cnt)) {
 		m_freem(ctx->mbuf_head);
-		gve_rx_ctx_clear(&rx->ctx);
+		rx->ctx = (struct gve_rx_ctx){};
 		device_printf(priv->dev,
 		    "Unexpected seq number %d with incomplete packet, expected %d, scheduling reset",
 		    GVE_SEQNO(desc->flags_seq), rx->seq_no);
@@ -620,7 +634,11 @@ gve_rx_cleanup_tq(void *arg, int pending)
 	struct gve_rx_ring *rx = arg;
 	struct gve_priv *priv = rx->com.priv;
 
+	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+		return;
+
 	gve_rx_cleanup(priv, rx, /*budget=*/128);
+
 	gve_db_bar_write_4(priv, rx->com.irq_db_offset,
 	    GVE_IRQ_ACK | GVE_IRQ_EVENT);
 

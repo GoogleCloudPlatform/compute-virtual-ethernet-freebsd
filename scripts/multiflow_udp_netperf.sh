@@ -29,19 +29,37 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-set -ex
+NUM_FLOWS=1
+TMPFILE="/tmp/a"
+DURATION=60
+SERVER_IP="192.168.100.1"
+DATAGRAM_SIZE="1408"
 
-SRCDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+while getopts f:l:s:m: name
+do
+    case ${name} in
+    s)   SERVER_IP="$OPTARG";;
+    f)   NUM_FLOWS="$OPTARG";;
+    l)   DURATION="$OPTARG";;
+    m)   DATAGRAM_SIZE="$OPTARG";;
+    ?)   printf "Usage: %s: [-s <server ip>] [-f <num flows>] [-l <test len seconds>] [-m <datagram size>]\n" $0
+          exit 2;;
+    esac
+done
 
-DESTDIR="$SRCDIR"/build/
-if [ ! -d "$DESTDIR" ]; then
- mkdir "$DESTDIR";
-fi
+pkill netperf
+: > ${TMPFILE}
 
-find "$DESTDIR" -type f -delete
+echo "$(date): Launching ${NUM_FLOWS} netperf client processes..."
+for i in $(seq 1 ${NUM_FLOWS}); do
+        echo "$(netperf -P 0 -H ${SERVER_IP} -l ${DURATION} -t UDP_STREAM -- -R 1 -m ${DATAGRAM_SIZE} -O local_send_throughput,remote_recv_throughput 2>&1) $(date)" | tee -a "${TMPFILE}" &
+done
+echo "$(date): ... done"
 
-cp "$SRCDIR"/*.c "$DESTDIR"/;
-cp "$SRCDIR"/*.h "$DESTDIR"/;
-cp "$SRCDIR"/Makefile "$DESTDIR"/Makefile;
-cp "$SRCDIR"/LICENSE "$DESTDIR"/LICENSE
-cp "$SRCDIR"/README.md "$DESTDIR"/README
+echo "$(date): Starting wait for netperfs"
+wait
+echo "$(date): Netperfs concluded"
+
+echo "Reporting throughput for $(cat ${TMPFILE} | wc -l) flows"
+echo "Total Local Send throughput is: $(awk '{sum += $1}END{print sum}' ${TMPFILE})"
+echo "Total Remote Recv throughput is: $(awk '{sum += $2}END{print sum}' ${TMPFILE})"

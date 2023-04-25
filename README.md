@@ -5,7 +5,7 @@ for Compute Engine. It is required to support per VM Tier1 networking
 performance, and for using certain VM shapes. gve is the driver for gVNIC.
 
 **0.9.X versions of gve are early releases, and thus might present bugs and might not be
-fully stable. The current version is 0.9.0.**
+fully stable. The current version is 0.9.2.**
 
 ### Supported Hardware
 
@@ -60,7 +60,7 @@ grep gve0`.
 ## Installation
 
 Since this is still an early-release, and not yet available in an official FreeBSD
-version, the driver has to installed as module. The following instructions
+version, the driver has to installed as a module. The following instructions
 refer to the gcloud command, but many of them can also be performed on the web UI.
 
 1. Create a FreeBSD 13 instance in your project, log into it, and become root.

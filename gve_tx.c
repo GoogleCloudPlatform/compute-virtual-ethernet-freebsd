@@ -299,13 +299,17 @@ gve_stop_tx_ring(struct gve_priv *priv, int i)
 	struct gve_tx_ring *tx = &priv->tx[i];
 	struct gve_ring_com *com = &tx->com;
 
-	while (taskqueue_cancel(com->cleanup_tq, &com->cleanup_task, NULL))
-		taskqueue_drain(com->cleanup_tq, &com->cleanup_task);
-	taskqueue_free(com->cleanup_tq);
+	if (com->cleanup_tq != NULL) {
+		taskqueue_quiesce(com->cleanup_tq);
+		taskqueue_free(com->cleanup_tq);
+		com->cleanup_tq = NULL;
+	}
 
-	while (taskqueue_cancel(tx->xmit_tq, &tx->xmit_task, NULL))
-		taskqueue_drain(tx->xmit_tq, &tx->xmit_task);
-	taskqueue_free(tx->xmit_tq);
+	if (tx->xmit_tq != NULL) {
+		taskqueue_quiesce(tx->xmit_tq);
+		taskqueue_free(tx->xmit_tq);
+		tx->xmit_tq = NULL;
+	}
 }
 
 int
@@ -366,6 +370,9 @@ gve_tx_cleanup_tq(void *arg, int pending)
 	uint32_t todo = nic_done - tx->done;
 	size_t space_freed = 0;
 	int i, j;
+
+	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+		return;
 
 	for (j = 0; j < todo; j++) {
 		uint32_t idx = tx->done & tx->mask;

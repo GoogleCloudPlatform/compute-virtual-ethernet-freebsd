@@ -31,7 +31,7 @@
 #include "gve.h"
 #include "gve_adminq.h"
 
-#define GVE_DRIVER_VERSION "GVE-FBSD-0.9.1\n"
+#define GVE_DRIVER_VERSION "GVE-FBSD-0.9.2\n"
 #define GVE_VERSION_MAJOR 0
 #define GVE_VERSION_MINOR 9
 #define GVE_VERSION_SUB	0
@@ -133,8 +133,11 @@ gve_up(struct gve_priv *priv)
 		goto reset;
 
 	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
-	if_link_state_change(ifp, LINK_STATE_UP);
-	gve_set_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
+
+	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_LINK_UP)) {
+		if_link_state_change(ifp, LINK_STATE_UP);
+		gve_set_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
+	}
 
 	gve_unmask_all_queue_irqs(priv);
 	gve_set_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP);
@@ -153,7 +156,11 @@ gve_down(struct gve_priv *priv)
 	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP))
 		return;
 
-	if_link_state_change(priv->ifp, LINK_STATE_DOWN);
+	if (gve_get_state_flag(priv, GVE_STATE_FLAG_LINK_UP)) {
+		if_link_state_change(priv->ifp, LINK_STATE_DOWN);
+		gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
+	}
+
 	if_setdrvflagbits(priv->ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
 
 	if (gve_destroy_rx_rings(priv) != 0)
@@ -165,8 +172,8 @@ gve_down(struct gve_priv *priv)
 	if (gve_unregister_qpls(priv) != 0)
 		goto reset;
 
+	gve_mask_all_queue_irqs(priv);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP);
-
 	return;
 
 reset:
@@ -589,7 +596,7 @@ gve_destroy(struct gve_priv *priv)
 	gve_release_adminq(priv);
 }
 
-static int
+static void
 gve_restore(struct gve_priv *priv)
 {
 	int err;
@@ -606,11 +613,11 @@ gve_restore(struct gve_priv *priv)
 	if (err != 0)
 		goto abort;
 
-	return (0);
+	return;
 
 abort:
 	device_printf(priv->dev, "Restore failed!\n");
-	return (err);
+	return;
 }
 
 static void
@@ -624,6 +631,7 @@ gve_handle_reset(struct gve_priv *priv)
 
 	GVE_GLOBAL_LOCK_LOCK();
 
+	if_setdrvflagbits(priv->ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
 	if_link_state_change(priv->ifp, LINK_STATE_DOWN);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 
@@ -661,9 +669,11 @@ gve_handle_link_status(struct gve_priv *priv)
 	if (link_up) {
 		device_printf(priv->dev, "Device link is up.\n");
 		if_link_state_change(priv->ifp, LINK_STATE_UP);
+		gve_set_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 	} else {
 		device_printf(priv->dev, "Device link is down.\n");
 		if_link_state_change(priv->ifp, LINK_STATE_DOWN);
+		gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 	}
 }
 

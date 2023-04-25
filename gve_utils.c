@@ -345,3 +345,16 @@ gve_unmask_all_queue_irqs(struct gve_priv *priv)
 		gve_db_bar_write_4(priv, rx->com.irq_db_offset, 0);
 	}
 }
+
+void
+gve_mask_all_queue_irqs(struct gve_priv *priv)
+{
+	for (int idx = 0; idx < priv->tx_cfg.num_queues; idx++) {
+		struct gve_tx_ring *tx = &priv->tx[idx];
+		gve_db_bar_write_4(priv, tx->com.irq_db_offset, GVE_IRQ_MASK);
+	}
+	for (int idx = 0; idx < priv->rx_cfg.num_queues; idx++) {
+		struct gve_rx_ring *rx = &priv->rx[idx];
+		gve_db_bar_write_4(priv, rx->com.irq_db_offset, GVE_IRQ_MASK);
+	}
+}

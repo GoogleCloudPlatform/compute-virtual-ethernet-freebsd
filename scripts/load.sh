@@ -29,19 +29,25 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-set -ex
+SOURCE_DIR="$(dirname "$0")/.."
+BUILD_DIR="build"
 
-SRCDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+pushd "${SOURCE_DIR}"
+trap "popd" EXIT
 
-DESTDIR="$SRCDIR"/build/
-if [ ! -d "$DESTDIR" ]; then
- mkdir "$DESTDIR";
+./build_src.sh && \
+  make -C "${BUILD_DIR}" clean && \
+  make -C "${BUILD_DIR}"
+
+if [[ $? -ne 0 ]]; then
+  echo "Driver build failed!"
+  exit 1
 fi
 
-find "$DESTDIR" -type f -delete
+kldstat | grep gve
+if [[ $? -eq 0 ]]; then
+  echo "Unloading existing driver"
+  kldunload gve || exit 1
+fi
 
-cp "$SRCDIR"/*.c "$DESTDIR"/;
-cp "$SRCDIR"/*.h "$DESTDIR"/;
-cp "$SRCDIR"/Makefile "$DESTDIR"/Makefile;
-cp "$SRCDIR"/LICENSE "$DESTDIR"/LICENSE
-cp "$SRCDIR"/README.md "$DESTDIR"/README
+kldload "${BUILD_DIR}/gve.ko"

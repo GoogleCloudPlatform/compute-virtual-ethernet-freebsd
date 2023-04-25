@@ -144,7 +144,8 @@ union gve_rx_data_slot {
 #define GVE_IRQ_MASK	BIT(30)
 #define GVE_IRQ_EVENT	BIT(29)
 
-static inline bool gve_needs_rss(__be16 flag)
+static inline bool
+gve_needs_rss(__be16 flag)
 {
 	if ((flag & GVE_RXF_FRAG) != 0)
 		return false;
@@ -153,7 +154,8 @@ static inline bool gve_needs_rss(__be16 flag)
 	return false;
 }
 
-static inline uint8_t gve_next_seqno(uint8_t seq)
+static inline uint8_t
+gve_next_seqno(uint8_t seq)
 {
 	return ((seq + 1) == 8 ? 1 : seq + 1);
 }
