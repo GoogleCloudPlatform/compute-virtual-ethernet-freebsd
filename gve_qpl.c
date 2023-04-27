@@ -142,7 +142,7 @@ gve_alloc_qpl(struct gve_priv *priv, uint32_t id, int pages)
 		err = gve_dma_alloc_coherent(priv, PAGE_SIZE, PAGE_SIZE,
 			  &qpl->dmas[i], BUS_DMA_WAITOK | BUS_DMA_ZERO);
 		if (err != 0) {
-			device_printf(priv->dev, "Cannot allocate QPL page\n");
+			device_printf(priv->dev, "Failed to allocate QPL page\n");
 			err = ENOMEM;
 			goto abort;
 		}

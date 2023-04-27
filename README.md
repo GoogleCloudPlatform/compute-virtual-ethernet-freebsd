@@ -5,7 +5,7 @@ for Compute Engine. It is required to support per VM Tier1 networking
 performance, and for using certain VM shapes. gve is the driver for gVNIC.
 
 **0.9.X versions of gve are early releases, and thus might present bugs and might not be
-fully stable. The current version is 0.9.2.**
+fully stable. The current version is 0.9.3.**
 
 ### Supported Hardware
 

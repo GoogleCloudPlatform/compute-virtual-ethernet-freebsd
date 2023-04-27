@@ -111,7 +111,7 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 
 	com->qpl = gve_assign_tx_qpl(priv);
 	if (com->qpl == NULL) {
-		device_printf(priv->dev, "No QPL left for tx ring %d i", i);
+		device_printf(priv->dev, "No QPL left for tx ring %d", i);
 		return (ENOMEM);
 	}
 	err = gve_tx_fifo_init(priv, &tx->fifo, com->qpl);
@@ -121,7 +121,7 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 	tx->info = malloc(sizeof(struct gve_tx_buffer_state) * priv->tx_desc_cnt,
 		       M_GVE, M_WAITOK | M_ZERO);
 	if (tx->info == NULL) {
-		device_printf(priv->dev, "Cannot alloc buf state array for tx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc buf state array for tx ring %d", i);
 		goto abort;
 	}
 
@@ -130,7 +130,7 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 
 	tx->br = buf_ring_alloc(GVE_TX_BUFRING_ENTRIES, M_DEVBUF, M_WAITOK, &tx->ring_mtx);
 	if (tx->br == NULL) {
-		device_printf(priv->dev, "Cannot alloc buf ring for tx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc buf ring for tx ring %d", i);
 		goto abort;
 	}
 
@@ -140,7 +140,7 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 		  PAGE_SIZE, &com->q_resources_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
-		device_printf(priv->dev, "Cannot alloc queue resources for tx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc queue resources for tx ring %d", i);
 		goto abort;
 	}
 	com->q_resources = com->q_resources_mem.cpu_addr;
@@ -150,7 +150,7 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 		  CACHE_LINE_SIZE, &tx->desc_ring_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
-		device_printf(priv->dev, "Cannot alloc desc ring for tx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc desc ring for tx ring %d", i);
 		goto abort;
 	}
 	tx->desc_ring = tx->desc_ring_mem.cpu_addr;
@@ -171,17 +171,15 @@ gve_alloc_tx_rings(struct gve_priv *priv)
 	priv->tx = malloc(sizeof(struct gve_tx_ring) * priv->tx_cfg.num_queues,
 		       M_GVE, M_NOWAIT | M_ZERO);
 	if (priv->tx == NULL) {
-		device_printf(priv->dev, "Could not alloc tx ring array\n");
+		device_printf(priv->dev, "Failed to alloc tx ring array\n");
 		return (ENOMEM);
 	}
 
 	for (i = 0; i < priv->tx_cfg.num_queues; i++) {
 		err = gve_tx_alloc_ring(priv, i);
-		if (err != 0) {
-			device_printf(priv->dev, "Failed to alloc tx ring=%d: err=%d\n",
-			    i, err);
+		if (err != 0)
 			goto free_rings;
-		}
+
 	}
 
 	return (0);

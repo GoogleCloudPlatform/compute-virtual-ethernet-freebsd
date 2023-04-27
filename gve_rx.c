@@ -99,14 +99,14 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 
 	com->qpl = gve_assign_rx_qpl(priv);
 	if (com->qpl == NULL) {
-		device_printf(priv->dev, "No QPL left for rx ring %d i", i);
+		device_printf(priv->dev, "No QPL left for rx ring %d", i);
 		return (ENOMEM);
 	}
 
 	rx->page_info = malloc(priv->rx_desc_cnt * sizeof(*rx->page_info), M_GVE,
 			    M_WAITOK | M_ZERO);
 	if (rx->page_info == NULL) {
-		device_printf(priv->dev, "Cannot alloc page_info for rx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc page_info for rx ring %d", i);
 		err = (ENOMEM);
 		goto abort;
 	}
@@ -117,7 +117,7 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 		  PAGE_SIZE, &com->q_resources_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
-		device_printf(priv->dev, "Cannot alloc queue resources for rx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc queue resources for rx ring %d", i);
 		goto abort;
 	}
 	com->q_resources = com->q_resources_mem.cpu_addr;
@@ -127,7 +127,7 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 		  CACHE_LINE_SIZE, &rx->desc_ring_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
-		device_printf(priv->dev, "Cannot alloc desc ring for rx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc desc ring for rx ring %d", i);
 		goto abort;
 	}
 	rx->desc_ring = rx->desc_ring_mem.cpu_addr;
@@ -137,7 +137,7 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 		  CACHE_LINE_SIZE, &rx->data_ring_mem,
 		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
 	if (err != 0) {
-		device_printf(priv->dev, "Cannot alloc data ring for rx ring %d", i);
+		device_printf(priv->dev, "Failed to alloc data ring for rx ring %d", i);
 		goto abort;
 	}
 	rx->data_ring = rx->data_ring_mem.cpu_addr;
@@ -159,17 +159,14 @@ gve_alloc_rx_rings(struct gve_priv *priv)
 	priv->rx = malloc(sizeof(struct gve_rx_ring) * priv->rx_cfg.num_queues,
 		       M_GVE, M_NOWAIT | M_ZERO);
 	if (priv->rx == NULL) {
-		device_printf(priv->dev, "Could not alloc rx ring array\n");
+		device_printf(priv->dev, "Failed to alloc rx ring array\n");
 		return (ENOMEM);
 	}
 
 	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
 		err = gve_rx_alloc_ring(priv, i);
-		if (err != 0) {
-			device_printf(priv->dev, "Failed to alloc rx ring=%d: err=%d\n",
-			    i, err);
+		if (err != 0)
 			goto free_rings;
-		}
 	}
 
 	return (0);
@@ -251,7 +248,7 @@ gve_start_rx_ring(struct gve_priv *priv, int i)
 
 	if ((priv->ifp->if_capenable & IFCAP_LRO) != 0) {
 		if (tcp_lro_init(&rx->lro) != 0)
-			device_printf(priv->dev, "Cannot init lro for rx ring %d", i);
+			device_printf(priv->dev, "Failed to init lro for rx ring %d", i);
 		rx->lro.ifp = priv->ifp;
 	}
 

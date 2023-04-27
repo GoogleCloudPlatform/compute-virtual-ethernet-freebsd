@@ -31,15 +31,12 @@
 #include "gve.h"
 #include "gve_adminq.h"
 
-#define GVE_DRIVER_VERSION "GVE-FBSD-0.9.2\n"
+#define GVE_DRIVER_VERSION "GVE-FBSD-0.9.3\n"
 #define GVE_VERSION_MAJOR 0
 #define GVE_VERSION_MINOR 9
 #define GVE_VERSION_SUB	0
 
 #define GVE_DEFAULT_RX_COPYBREAK 256
-#define GVE_TX_TSO_SEGMENTS_MAX 18
-#define GVE_TSO_MAX_SIZE 65535
-#define GVE_TSO_MAXSEG_SIZE 65535
 
 struct sx gve_global_lock;
 
@@ -103,7 +100,7 @@ gve_up(struct gve_priv *priv)
 	GVE_GLOBAL_LOCK_ASSERT();
 
 	if (device_is_attached(priv->dev) == 0) {
-		device_printf(priv->dev, "device is not attached!\n");
+		device_printf(priv->dev, "Cannot bring the iface up when detached\n");
 		return (ENXIO);
 	}
 
@@ -352,7 +349,7 @@ gve_setup_ifnet(device_t dev, struct gve_priv *priv)
 
 	ifp = priv->ifp = if_alloc(IFT_ETHER);
 	if (ifp == NULL) {
-		device_printf(priv->dev, "Cannot allocate ifnet struct\n");
+		device_printf(priv->dev, "Failed to allocate ifnet struct\n");
 		return (ENXIO);
 	}
 
@@ -378,10 +375,6 @@ gve_setup_ifnet(device_t dev, struct gve_priv *priv)
 
 	if_setcapabilities(ifp, caps);
 	if_setcapenable(ifp, caps);
-
-	if_sethwtsomax(ifp, min(GVE_TSO_MAX_SIZE, IP_MAXPACKET));
-	if_sethwtsomaxsegcount(ifp, GVE_TX_TSO_SEGMENTS_MAX - 3);
-	if_sethwtsomaxsegsize(ifp, GVE_TSO_MAXSEG_SIZE);
 
 	device_printf(priv->dev, "Setting initial MTU to %d\n", priv->max_mtu);
 	if_setmtu(ifp, priv->max_mtu);
@@ -486,7 +479,7 @@ gve_deconfigure_resources(struct gve_priv *priv)
 	if (gve_get_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK)) {
 		err = gve_adminq_deconfigure_device_resources(priv);
 		if (err != 0) {
-			device_printf(priv->dev, "Could not deconfigure device resources: err=%d\n",
+			device_printf(priv->dev, "Failed to deconfigure device resources: err=%d\n",
 			    err);
 			return;
 		}
@@ -516,7 +509,7 @@ gve_configure_resources(struct gve_priv *priv)
 
 	err = gve_adminq_configure_device_resources(priv);
 	if (err != 0) {
-		device_printf(priv->dev, "Couldn't configure device resources: err=%d\n",
+		device_printf(priv->dev, "Failed to configure device resources: err=%d\n",
 			      err);
 		err = (ENXIO);
 		goto abort;
@@ -560,7 +553,7 @@ gve_alloc_adminq_and_describe_device(struct gve_priv *priv)
 
 	if ((err = gve_verify_driver_compatibility(priv)) != 0) {
 		device_printf(priv->dev,
-		    "Could not verify driver compatibility: err=%d\n", err);
+		    "Failed to verify driver compatibility: err=%d\n", err);
 		goto abort;
 	}
 

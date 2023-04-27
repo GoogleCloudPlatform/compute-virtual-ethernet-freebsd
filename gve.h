@@ -47,7 +47,7 @@
 #define GVE_TX_MAX_DESCS	4
 #define GVE_TX_BUFRING_ENTRIES	4096
 
-#define ADMINQ_SIZE 4096
+#define ADMINQ_SIZE PAGE_SIZE
 
 /* Each RX bounce buffer page can fit two packet buffers. */
 #define GVE_DEFAULT_RX_BUFFER_SIZE (PAGE_SIZE / 2)

@@ -340,7 +340,7 @@ gve_adminq_describe_device(struct gve_priv *priv)
 	rc = gve_dma_alloc_coherent(
 		 priv, ADMINQ_SIZE, ADMINQ_SIZE, &desc_mem, BUS_DMA_WAITOK | BUS_DMA_ZERO);
 	if (rc != 0) {
-		device_printf(priv->dev, "could not allocate DMA memory for descriptor.\n");
+		device_printf(priv->dev, "Failed to alloc DMA mem for DescribeDevice.\n");
 		return (rc);
 	}
 
@@ -455,7 +455,6 @@ int
 gve_adminq_configure_device_resources(struct gve_priv *priv)
 {
 	struct gve_adminq_command aq_cmd = (struct gve_adminq_command){};
-	int rc;
 
 	bus_dmamap_sync(priv->irqs_db_mem.tag, priv->irqs_db_mem.map,
 			BUS_DMASYNC_PREREAD);
@@ -474,28 +473,16 @@ gve_adminq_configure_device_resources(struct gve_priv *priv)
 		.queue_format = priv->queue_format,
 	};
 
-	rc = gve_adminq_execute_cmd(priv, &aq_cmd);
-	if (rc != 0)
-		device_printf(priv->dev, "failed to configure device resources\n");
-
-	return (rc);
+	return (gve_adminq_execute_cmd(priv, &aq_cmd));
 }
 
 int
 gve_adminq_deconfigure_device_resources(struct gve_priv *priv)
 {
 	struct gve_adminq_command aq_cmd = (struct gve_adminq_command){};
-	int rc;
 
 	aq_cmd.opcode = htobe32(GVE_ADMINQ_DECONFIGURE_DEVICE_RESOURCES);
-	rc = gve_adminq_execute_cmd(priv, &aq_cmd);
-	if (rc != 0)
-		goto err;
-
-	return (0);
-err:
-	device_printf(priv->dev, "failed to deconfigure device resources\n");
-	return (rc);
+	return (gve_adminq_execute_cmd(priv, &aq_cmd));
 }
 
 int
@@ -594,7 +581,7 @@ gve_adminq_parse_err(struct gve_priv *priv, uint32_t opcode, uint32_t status)
 
 	case GVE_ADMINQ_COMMAND_UNSET:
 		device_printf(priv->dev,
-		    "AQ command(%u) parse_aq_err: err and status both unset, this should not be possible.\n",
+		    "AQ command(%u): err and status both unset, this should not be possible.\n",
 		    opcode);
 		return  (EINVAL);
 
@@ -627,7 +614,7 @@ gve_adminq_parse_err(struct gve_priv *priv, uint32_t opcode, uint32_t status)
 		return (EOPNOTSUPP);
 
 	default:
-		device_printf(priv->dev, "AQ command(%u) parse_aq_err: unknown status code %d\n",
+		device_printf(priv->dev, "AQ command(%u): unknown status code %d\n",
 		    opcode, status);
 		return (EINVAL);
 	}

@@ -188,13 +188,13 @@ gve_free_irqs(struct gve_priv *priv)
 
 		rc = bus_teardown_intr(priv->dev, irq->res, irq->cookie);
 		if (rc != 0)
-			device_printf(priv->dev, "Could not teardown irq num %d\n",
+			device_printf(priv->dev, "Failed to teardown irq num %d\n",
 				      rid);
 
 		rc = bus_release_resource(priv->dev, SYS_RES_IRQ,
 					  rid, irq->res);
 		if (rc != 0)
-			device_printf(priv->dev, "Could not release irq num %d\n",
+			device_printf(priv->dev, "Failed to release irq num %d\n",
 				      rid);
 
 		irq->res = NULL;
@@ -240,7 +240,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 	priv->irq_tbl = malloc(sizeof(struct gve_irq) * req_nvecs, M_GVE,
 			       M_NOWAIT | M_ZERO);
 	if (priv->irq_tbl == NULL) {
-		device_printf(priv->dev, "Could not alloc irq table\n");
+		device_printf(priv->dev, "Failed to alloc irq table\n");
 		err = ENOMEM;
 		goto abort;
 	}
@@ -255,7 +255,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 						  &rid, RF_ACTIVE);
 		if (irq->res == NULL) {
 			device_printf(priv->dev,
-				      "Could not alloc irq %d for Tx queue %d\n",
+				      "Failed to alloc irq %d for Tx queue %d\n",
 				      rid, i);
 			err = ENOMEM;
 			goto abort;
@@ -264,7 +264,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 		err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
 		         gve_tx_intr, NULL, &priv->tx[i], &irq->cookie);
 		if (err != 0) {
-			device_printf(priv->dev, "Could not setup irq %d for Tx queue %d, "
+			device_printf(priv->dev, "Failed to setup irq %d for Tx queue %d, "
 			    "err: %d\n", rid, i, err);
 			goto abort;
 		}
@@ -283,7 +283,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 			       &rid, RF_ACTIVE);
 		if (irq->res == NULL) {
 			device_printf(priv->dev,
-			    "Could not alloc irq %d for Rx queue %d", rid, j);
+			    "Failed to alloc irq %d for Rx queue %d", rid, j);
 			err = ENOMEM;
 			goto abort;
 		}
@@ -291,7 +291,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 		err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
 		         gve_rx_intr, NULL, &priv->rx[j], &irq->cookie);
 		if (err != 0) {
-			device_printf(priv->dev, "Could not setup irq %d for Rx queue %d, "
+			device_printf(priv->dev, "Failed to setup irq %d for Rx queue %d, "
 			    "err: %d\n", rid, j, err);
 			goto abort;
 		}
@@ -307,7 +307,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 	irq->res = bus_alloc_resource_any(priv->dev, SYS_RES_IRQ,
 		       &rid, RF_ACTIVE);
 	if (irq->res == NULL) {
-		device_printf(priv->dev, "Could not allocate irq %d for mgmnt queue\n", rid);
+		device_printf(priv->dev, "Failed to allocate irq %d for mgmnt queue\n", rid);
 		err = ENOMEM;
 		goto abort;
 	}
@@ -315,7 +315,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 	err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
 	         gve_mgmnt_intr, NULL, priv, &irq->cookie);
 	if (err != 0) {
-		device_printf(priv->dev, "Could not setup irq %d for mgmnt queue\n, err: %d",
+		device_printf(priv->dev, "Failed to setup irq %d for mgmnt queue, err: %d\n",
 		    rid, err);
 		goto abort;
 	}
