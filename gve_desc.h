@@ -33,7 +33,8 @@
 
 #include "gve_plat.h"
 
-/* A note on seg_addrs
+/*
+ * A note on seg_addrs
  *
  * Base addresses encoded in seg_addr are not assumed to be physical
  * addresses. The ring format assumes these come from some linear address
@@ -95,8 +96,10 @@ struct gve_tx_seg_desc {
 #define GVE_MTD_PATH_HASH_NONE		(0x0 << 4)
 #define GVE_MTD_PATH_HASH_L4		(0x1 << 4)
 
-/* GVE Receive Packet Descriptor */
-/* The start of an ethernet packet comes 2 bytes into the rx buffer.
+/*
+ * GVE Receive Packet Descriptor
+ *
+ * The start of an ethernet packet comes 2 bytes into the rx buffer.
  * gVNIC adds this padding so that both the DMA and the L3/4 protocol header
  * access is aligned.
  */
@@ -107,15 +110,16 @@ struct gve_rx_desc {
 	__be32	rss_hash;  /* Receive-side scaling hash (Toeplitz for gVNIC) */
 	__be16	mss;
 	__be16	reserved;  /* Reserved to zero */
-	uint8_t	hdr_len;  /* Header length (L2-L4) including padding */
-	uint8_t	hdr_off;  /* 64-byte-scaled offset into RX_DATA entry */
-	__sum16	csum;  /* 1's-complement partial checksum of L3+ bytes */
-	__be16	len;  /* Length of the received packet */
-	__be16	flags_seq;  /* Flags [15:3] and sequence number [2:0] (1-7) */
+	uint8_t	hdr_len;   /* Header length (L2-L4) including padding */
+	uint8_t	hdr_off;   /* 64-byte-scaled offset into RX_DATA entry */
+	uint16_t csum;     /* 1's-complement partial checksum of L3+ bytes */
+	__be16	len;       /* Length of the received packet */
+	__be16	flags_seq; /* Flags [15:3] and sequence number [2:0] (1-7) */
 } __packed;
-static_assert(sizeof(struct gve_rx_desc) == 64);
+_Static_assert(sizeof(struct gve_rx_desc) == 64, "gve: bad desc struct length");
 
-/* If the device supports raw dma addressing then the addr in data slot is
+/*
+ * If the device supports raw dma addressing then the addr in data slot is
  * the dma address of the buffer.
  * If the device only supports registered segments then the addr is a byte
  * offset into the registered segment (an ordered list of pages) where the
@@ -144,19 +148,4 @@ union gve_rx_data_slot {
 #define GVE_IRQ_MASK	BIT(30)
 #define GVE_IRQ_EVENT	BIT(29)
 
-static inline bool
-gve_needs_rss(__be16 flag)
-{
-	if ((flag & GVE_RXF_FRAG) != 0)
-		return false;
-	if ((flag & (GVE_RXF_IPV4 | GVE_RXF_IPV6)) != 0)
-		return true;
-	return false;
-}
-
-static inline uint8_t
-gve_next_seqno(uint8_t seq)
-{
-	return ((seq + 1) == 8 ? 1 : seq + 1);
-}
 #endif /* _GVE_DESC_H_ */

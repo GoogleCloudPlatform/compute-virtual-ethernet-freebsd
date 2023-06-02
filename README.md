@@ -4,9 +4,6 @@ Google Virtual NIC (gVNIC) is a virtual network interface designed specifically
 for Compute Engine. It is required to support per VM Tier1 networking
 performance, and for using certain VM shapes. gve is the driver for gVNIC.
 
-**0.9.X versions of gve are early releases, and thus might present bugs and might not be
-fully stable. The current version is 0.9.3.**
-
 ### Supported Hardware
 
 The driver here binds to a single PCI device id used by the virtual Ethernet

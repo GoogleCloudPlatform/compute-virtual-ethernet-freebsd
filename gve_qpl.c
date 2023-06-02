@@ -35,56 +35,22 @@
 
 static MALLOC_DEFINE(M_GVE_QPL, "gve qpl", "gve qpl allocations");
 
-uint32_t
+static uint32_t
 gve_num_tx_qpls(struct gve_priv *priv)
 {
 	if (priv->queue_format != GVE_GQI_QPL_FORMAT)
 		return (0);
 
-	return (priv->tx_cfg.num_queues);
+	return (priv->tx_cfg.max_queues);
 }
 
-uint32_t
+static uint32_t
 gve_num_rx_qpls(struct gve_priv *priv)
 {
 	if (priv->queue_format != GVE_GQI_QPL_FORMAT)
 		return (0);
 
-	return (priv->rx_cfg.num_queues);
-}
-
-struct gve_queue_page_list *
-gve_assign_tx_qpl(struct gve_priv *priv)
-{
-	int id = find_first_zero_bit(priv->qpl_cfg.qpl_id_map,
-		     priv->qpl_cfg.qpl_map_size);
-
-	/* we are out of tx qpls */
-	if (id >= gve_num_tx_qpls(priv))
-		return (NULL);
-
-	set_bit(id, priv->qpl_cfg.qpl_id_map);
-	return (&priv->qpls[id]);
-}
-
-struct gve_queue_page_list *
-gve_assign_rx_qpl(struct gve_priv *priv)
-{
-	int id = find_next_zero_bit(priv->qpl_cfg.qpl_id_map,
-	    priv->qpl_cfg.qpl_map_size, gve_num_tx_qpls(priv));
-
-	/* we are out of rx qpls */
-	if (id == gve_num_tx_qpls(priv) + gve_num_rx_qpls(priv))
-		return (NULL);
-
-	set_bit(id, priv->qpl_cfg.qpl_id_map);
-	return (&priv->qpls[id]);
-}
-
-void
-gve_unassign_qpl(struct gve_priv *priv, int id)
-{
-	clear_bit(id, priv->qpl_cfg.qpl_id_map);
+	return (priv->rx_cfg.max_queues);
 }
 
 static void
@@ -93,13 +59,31 @@ gve_free_qpl(struct gve_priv *priv, uint32_t id)
 	struct gve_queue_page_list *qpl = &priv->qpls[id];
 	int i;
 
-	if (qpl->dmas != NULL && qpl->pages != NULL) {
-		for (i = 0; i < qpl->num_entries; i++) {
-			if (qpl->pages[i] != NULL) {
-				gve_dma_free_coherent(&qpl->dmas[i]);
-				priv->num_registered_pages--;
+	for (i = 0; i < qpl->num_dmas; i++) {
+		gve_dmamap_destroy(&qpl->dmas[i]);
+	}
+
+	if (qpl->kva) {
+		pmap_qremove(qpl->kva, qpl->num_pages);
+		kva_free(qpl->kva, PAGE_SIZE * qpl->num_pages);
+	}
+
+	for (i = 0; i < qpl->num_pages; i++) {
+		/*
+		 * Free the page only if this is the last ref.
+		 * Tx pages are known to have no other refs at
+		 * this point, but Rx pages might still be in
+		 * use by the networking stack, see gve_mextadd_free.
+		 */
+		if (vm_page_unwire_noq(qpl->pages[i])) {
+			if (!qpl->kva) {
+				pmap_qremove((vm_offset_t)qpl->dmas[i].cpu_addr, 1);
+				kva_free((vm_offset_t)qpl->dmas[i].cpu_addr, PAGE_SIZE);
 			}
+			vm_page_free(qpl->pages[i]);
 		}
+
+		priv->num_registered_pages--;
 	}
 
 	if (qpl->pages != NULL)
@@ -110,44 +94,71 @@ gve_free_qpl(struct gve_priv *priv, uint32_t id)
 }
 
 static int
-gve_alloc_qpl(struct gve_priv *priv, uint32_t id, int pages)
+gve_alloc_qpl(struct gve_priv *priv, uint32_t id, int npages, bool single_kva)
 {
 	struct gve_queue_page_list *qpl = &priv->qpls[id];
 	int err;
 	int i;
 
-	if (pages + priv->num_registered_pages > priv->max_registered_pages) {
+	if (npages + priv->num_registered_pages > priv->max_registered_pages) {
 		device_printf(priv->dev, "Reached max number of registered pages %lu > %lu\n",
-		    pages + priv->num_registered_pages,
+		    npages + priv->num_registered_pages,
 		    priv->max_registered_pages);
 		return (EINVAL);
 	}
 
 	qpl->id = id;
-	qpl->num_entries = 0;
+	qpl->num_pages = 0;
+	qpl->num_dmas = 0;
 
-	qpl->dmas = malloc(pages * sizeof(*qpl->dmas), M_GVE_QPL,
-		        M_WAITOK | M_ZERO);
-	if (qpl->dmas == NULL)
-		return (ENOMEM);
+	qpl->dmas = malloc(npages * sizeof(*qpl->dmas), M_GVE_QPL,
+	    M_WAITOK | M_ZERO);
 
-	qpl->pages = malloc(pages * sizeof(*qpl->pages), M_GVE_QPL,
-			 M_WAITOK | M_ZERO);
-	if (qpl->pages == NULL) {
-		err = ENOMEM;
-		goto abort;
-	}
+	qpl->pages = malloc(npages * sizeof(*qpl->pages), M_GVE_QPL,
+	    M_WAITOK | M_ZERO);
 
-	for (i = 0; i < pages; i++) {
-		err = gve_dma_alloc_coherent(priv, PAGE_SIZE, PAGE_SIZE,
-			  &qpl->dmas[i], BUS_DMA_WAITOK | BUS_DMA_ZERO);
-		if (err != 0) {
-			device_printf(priv->dev, "Failed to allocate QPL page\n");
+	qpl->kva = 0;
+	if (single_kva) {
+		qpl->kva = kva_alloc(PAGE_SIZE * npages);
+		if (!qpl->kva) {
+			device_printf(priv->dev, "Failed to create the single kva for QPL %d\n", id);
 			err = ENOMEM;
 			goto abort;
 		}
-		qpl->pages[i] = virt_to_page(qpl->dmas[i].cpu_addr);
-		qpl->num_entries++;
+	}
+
+	for (i = 0; i < npages; i++) {
+		qpl->pages[i] = vm_page_alloc_noobj(VM_ALLOC_WIRED |
+						    VM_ALLOC_WAITOK |
+						    VM_ALLOC_ZERO);
+
+		if (!single_kva) {
+			qpl->dmas[i].cpu_addr = (void *)kva_alloc(PAGE_SIZE);
+			if (!qpl->dmas[i].cpu_addr) {
+				device_printf(priv->dev, "Failed to create kva for page %d in QPL %d", i, id);
+				err = ENOMEM;
+				goto abort;
+			}
+			pmap_qenter((vm_offset_t)qpl->dmas[i].cpu_addr, &(qpl->pages[i]), 1);
+		} else
+			qpl->dmas[i].cpu_addr = (void *)(qpl->kva + (PAGE_SIZE * i));
+
+
+		qpl->num_pages++;
+	}
+
+	if (single_kva)
+		pmap_qenter(qpl->kva, qpl->pages, npages);
+
+	for (i = 0; i < npages; i++) {
+		err = gve_dmamap_create(priv, /*size=*/PAGE_SIZE, /*align=*/PAGE_SIZE,
+		    &qpl->dmas[i]);
+		if (err != 0) {
+			device_printf(priv->dev, "Failed to dma-map page %d in QPL %d\n", i, id);
+			goto abort;
+		}
+
+		qpl->num_dmas++;
 		priv->num_registered_pages++;
 	}
 
@@ -172,9 +183,6 @@ gve_free_qpls(struct gve_priv *priv)
 			gve_free_qpl(priv, i);
 		free(priv->qpls, M_GVE_QPL);
 	}
-
-	if (priv->qpl_cfg.qpl_id_map != NULL)
-		free(priv->qpl_cfg.qpl_id_map, M_GVE_QPL);
 }
 
 int gve_alloc_qpls(struct gve_priv *priv)
@@ -187,30 +195,19 @@ int gve_alloc_qpls(struct gve_priv *priv)
 		return (0);
 
 	priv->qpls = malloc(num_qpls * sizeof(*priv->qpls), M_GVE_QPL,
-		         M_WAITOK | M_ZERO);
-	if (priv->qpls == NULL)
-		return (ENOMEM);
+	    M_WAITOK | M_ZERO);
 
 	for (i = 0; i < gve_num_tx_qpls(priv); i++) {
-		err = gve_alloc_qpl(priv, i, priv->tx_desc_cnt / GVE_QPL_DIVISOR);
+		err = gve_alloc_qpl(priv, i, priv->tx_desc_cnt / GVE_QPL_DIVISOR,
+		    /*single_kva=*/true);
 		if (err != 0)
 			goto abort;
 	}
 
 	for (; i < num_qpls; i++) {
-		err = gve_alloc_qpl(priv, i, priv->rx_desc_cnt);
+		err = gve_alloc_qpl(priv, i, priv->rx_desc_cnt, /*single_kva=*/false);
 		if (err != 0)
 			goto abort;
-	}
-
-	priv->qpl_cfg.qpl_map_size = BITS_TO_LONGS(num_qpls) *
-				     sizeof(unsigned long) * BITS_PER_BYTE;
-	priv->qpl_cfg.qpl_id_map = malloc(BITS_TO_LONGS(num_qpls) *
-					  sizeof(unsigned long), M_GVE_QPL,
-					  M_WAITOK | M_ZERO);
-	if (priv->qpl_cfg.qpl_id_map == 0) {
-		err = ENOMEM;
-		goto abort;
 	}
 
 	return (0);

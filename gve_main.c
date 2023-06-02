@@ -31,7 +31,7 @@
 #include "gve.h"
 #include "gve_adminq.h"
 
-#define GVE_DRIVER_VERSION "GVE-FBSD-0.9.3\n"
+#define GVE_DRIVER_VERSION "GVE-FBSD-1.0.0\n"
 #define GVE_VERSION_MAJOR 0
 #define GVE_VERSION_MINOR 9
 #define GVE_VERSION_SUB	0
@@ -48,8 +48,7 @@ gve_verify_driver_compatibility(struct gve_priv *priv)
 	struct gve_dma_handle driver_info_mem;
 
 	err = gve_dma_alloc_coherent(priv, sizeof(struct gve_driver_info),
-		  PAGE_SIZE, &driver_info_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    PAGE_SIZE, &driver_info_mem);
 
 	if (err != 0)
 		return (ENOMEM);
@@ -75,12 +74,11 @@ gve_verify_driver_compatibility(struct gve_priv *priv)
 	snprintf(driver_info->os_version_str1, sizeof(driver_info->os_version_str1),
 	    "FreeBSD %u", __FreeBSD_version);
 
-	bus_dmamap_sync(
-	    driver_info_mem.tag, driver_info_mem.map, BUS_DMASYNC_PREREAD);
+	bus_dmamap_sync(driver_info_mem.tag, driver_info_mem.map,
+	    BUS_DMASYNC_PREREAD);
 
 	err = gve_adminq_verify_driver_compatibility(priv,
-		  sizeof(struct gve_driver_info),
-		  driver_info_mem.bus_addr);
+	    sizeof(struct gve_driver_info), driver_info_mem.bus_addr);
 
 	/* It's ok if the device doesn't support this */
 	if (err == EOPNOTSUPP)
@@ -97,7 +95,7 @@ gve_up(struct gve_priv *priv)
 	if_t ifp = priv->ifp;
 	int err;
 
-	GVE_GLOBAL_LOCK_ASSERT();
+	GVE_IFACE_LOCK_ASSERT(priv->gve_iface_lock);
 
 	if (device_is_attached(priv->dev) == 0) {
 		device_printf(priv->dev, "Cannot bring the iface up when detached\n");
@@ -138,6 +136,7 @@ gve_up(struct gve_priv *priv)
 
 	gve_unmask_all_queue_irqs(priv);
 	gve_set_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP);
+	priv->interface_up_cnt++;
 	return (0);
 
 reset:
@@ -148,7 +147,7 @@ reset:
 static void
 gve_down(struct gve_priv *priv)
 {
-	GVE_GLOBAL_LOCK_ASSERT();
+	GVE_IFACE_LOCK_ASSERT(priv->gve_iface_lock);
 
 	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP))
 		return;
@@ -171,6 +170,7 @@ gve_down(struct gve_priv *priv)
 
 	gve_mask_all_queue_irqs(priv);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP);
+	priv->interface_down_cnt++;
 	return;
 
 reset:
@@ -180,18 +180,19 @@ reset:
 static int
 gve_set_mtu(if_t ifp, uint32_t new_mtu)
 {
+	struct gve_priv *priv = if_getsoftc(ifp);
 	int err;
-	struct gve_priv *priv = ifp->if_softc;
 
 	if ((new_mtu > priv->max_mtu) || (new_mtu < ETHERMIN)) {
-		device_printf(priv->dev, "Invalid New MTU setting. new_mtu: %d max mtu: %d min mtu: %d\n",
+		device_printf(priv->dev, "Invalid new MTU setting. new mtu: %d max mtu: %d min mtu: %d\n",
 		    new_mtu, priv->max_mtu, ETHERMIN);
 		return (EINVAL);
 	}
 
 	err = gve_adminq_set_mtu(priv, new_mtu);
 	if (err == 0) {
-		device_printf(priv->dev, "MTU set to %d\n", new_mtu);
+		if (bootverbose)
+			device_printf(priv->dev, "MTU set to %d\n", new_mtu);
 		if_setmtu(ifp, new_mtu);
 	} else {
 		device_printf(priv->dev, "Failed to set MTU to %d\n", new_mtu);
@@ -206,9 +207,9 @@ gve_init(void *arg)
 	struct gve_priv *priv = (struct gve_priv *)arg;
 
 	if (!gve_get_state_flag(priv, GVE_STATE_FLAG_QUEUES_UP)) {
-		GVE_GLOBAL_LOCK_LOCK();
+		GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 		gve_up(priv);
-		GVE_GLOBAL_LOCK_UNLOCK();
+		GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 	}
 }
 
@@ -219,44 +220,44 @@ gve_ioctl(if_t ifp, u_long command, caddr_t data)
 	struct ifreq *ifr;
 	int rc = 0;
 
-	priv = ifp->if_softc;
+	priv = if_getsoftc(ifp);
 	ifr = (struct ifreq *)data;
 
 	switch (command) {
 	case SIOCSIFMTU:
-		if (ifp->if_mtu == ifr->ifr_mtu)
+		if (if_getmtu(ifp) == ifr->ifr_mtu)
 			break;
-		GVE_GLOBAL_LOCK_LOCK();
+		GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 		gve_down(priv);
 		gve_set_mtu(ifp, ifr->ifr_mtu);
 		rc = gve_up(priv);
-		GVE_GLOBAL_LOCK_UNLOCK();
+		GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 		break;
 
 	case SIOCSIFFLAGS:
-		if ((ifp->if_flags & IFF_UP) != 0) {
+		if ((if_getflags(ifp) & IFF_UP) != 0) {
 			if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0) {
-				GVE_GLOBAL_LOCK_LOCK();
+				GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 				rc = gve_up(priv);
-				GVE_GLOBAL_LOCK_UNLOCK();
+				GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 			}
 		} else {
 			if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0) {
-				GVE_GLOBAL_LOCK_LOCK();
+				GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 				gve_down(priv);
-				GVE_GLOBAL_LOCK_UNLOCK();
+				GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 			}
 		}
 		break;
 
 	case SIOCSIFCAP:
-		if (ifr->ifr_reqcap == ifp->if_capenable)
+		if (ifr->ifr_reqcap == if_getcapenable(ifp))
 			break;
-		GVE_GLOBAL_LOCK_LOCK();
+		GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 		gve_down(priv);
-		ifp->if_capenable = ifr->ifr_reqcap;
+		if_setcapenable(ifp, ifr->ifr_reqcap);
 		rc = gve_up(priv);
-		GVE_GLOBAL_LOCK_UNLOCK();
+		GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 		break;
 
 	case SIOCSIFMEDIA:
@@ -276,7 +277,7 @@ gve_ioctl(if_t ifp, u_long command, caddr_t data)
 static int
 gve_media_change(if_t ifp)
 {
-	struct gve_priv *priv = ifp->if_softc;
+	struct gve_priv *priv = if_getsoftc(ifp);
 
 	device_printf(priv->dev, "Media change not supported\n");
 	return (0);
@@ -287,7 +288,7 @@ gve_media_status(if_t ifp, struct ifmediareq *ifmr)
 {
 	struct gve_priv *priv = if_getsoftc(ifp);
 
-	GVE_GLOBAL_LOCK_LOCK();
+	GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 
 	ifmr->ifm_status = IFM_AVALID;
 	ifmr->ifm_active = IFM_ETHER;
@@ -299,11 +300,12 @@ gve_media_status(if_t ifp, struct ifmediareq *ifmr)
 		ifmr->ifm_active |= IFM_NONE;
 	}
 
-	GVE_GLOBAL_LOCK_UNLOCK();
+	GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 }
 
 static uint64_t
-gve_get_counter(if_t ifp, ift_counter cnt) {
+gve_get_counter(if_t ifp, ift_counter cnt)
+{
 	struct gve_priv *priv;
 	uint64_t rpackets = 0;
 	uint64_t tpackets = 0;
@@ -360,14 +362,20 @@ gve_setup_ifnet(device_t dev, struct gve_priv *priv)
 	if_setioctlfn(ifp, gve_ioctl);
 	if_settransmitfn(ifp, gve_xmit_ifp);
 	if_setqflushfn(ifp, gve_qflush);
+
+#if __FreeBSD_version >= 1400086
+	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
+#else
 	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST | IFF_KNOWSEPOCH);
+#endif
+
 	ifmedia_init(&priv->media, IFM_IMASK, gve_media_change, gve_media_status);
 	if_setgetcounterfn(ifp, gve_get_counter);
 
-	caps = IFCAP_RXCSUM | \
-	       IFCAP_TXCSUM | \
-	       IFCAP_TXCSUM_IPV6 | \
-	       IFCAP_TSO | \
+	caps = IFCAP_RXCSUM |
+	       IFCAP_TXCSUM |
+	       IFCAP_TXCSUM_IPV6 |
+	       IFCAP_TSO |
 	       IFCAP_LRO;
 
 	if ((priv->supported_features & GVE_SUP_JUMBO_FRAMES_MASK) != 0)
@@ -376,7 +384,8 @@ gve_setup_ifnet(device_t dev, struct gve_priv *priv)
 	if_setcapabilities(ifp, caps);
 	if_setcapenable(ifp, caps);
 
-	device_printf(priv->dev, "Setting initial MTU to %d\n", priv->max_mtu);
+	if (bootverbose)
+		device_printf(priv->dev, "Setting initial MTU to %d\n", priv->max_mtu);
 	if_setmtu(ifp, priv->max_mtu);
 
 	ether_ifattach(ifp, priv->mac);
@@ -393,8 +402,7 @@ gve_alloc_counter_array(struct gve_priv *priv)
 	int err;
 
 	err = gve_dma_alloc_coherent(priv, sizeof(uint32_t) * priv->num_event_counters,
-		  PAGE_SIZE, &priv->counter_array_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    PAGE_SIZE, &priv->counter_array_mem);
 	if (err != 0)
 		return (err);
 
@@ -416,9 +424,8 @@ gve_alloc_irq_db_array(struct gve_priv *priv)
 	int err;
 
 	err = gve_dma_alloc_coherent(priv,
-		  sizeof(struct gve_irq_db) * (priv->num_queues), PAGE_SIZE,
-		  &priv->irqs_db_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    sizeof(struct gve_irq_db) * (priv->num_queues), PAGE_SIZE,
+	    &priv->irqs_db_mem);
 	if (err != 0)
 		return (err);
 
@@ -435,7 +442,7 @@ gve_free_irq_db_array(struct gve_priv *priv)
 }
 
 static void
-gve_free_rings(struct gve_priv* priv)
+gve_free_rings(struct gve_priv *priv)
 {
 	gve_free_irqs(priv);
 	gve_free_tx_rings(priv);
@@ -444,7 +451,7 @@ gve_free_rings(struct gve_priv* priv)
 }
 
 static int
-gve_alloc_rings(struct gve_priv* priv)
+gve_alloc_rings(struct gve_priv *priv)
 {
 	int err;
 
@@ -483,7 +490,8 @@ gve_deconfigure_resources(struct gve_priv *priv)
 			    err);
 			return;
 		}
-		device_printf(priv->dev, "Deconfigured device resources\n");
+		if (bootverbose)
+			device_printf(priv->dev, "Deconfigured device resources\n");
 		gve_clear_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
 	}
 
@@ -516,7 +524,8 @@ gve_configure_resources(struct gve_priv *priv)
 	}
 
 	gve_set_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
-	device_printf(priv->dev, "Configured device resources\n");
+	if (bootverbose)
+		device_printf(priv->dev, "Configured device resources\n");
 	return (0);
 
 abort:
@@ -533,10 +542,10 @@ gve_set_queue_cnts(struct gve_priv *priv)
 	priv->rx_cfg.num_queues = priv->rx_cfg.max_queues;
 
 	if (priv->default_num_queues > 0) {
-		priv->tx_cfg.num_queues = min_t(int, priv->default_num_queues,
-					      priv->tx_cfg.num_queues);
-		priv->rx_cfg.num_queues = min_t(int, priv->default_num_queues,
-					      priv->rx_cfg.num_queues);
+		priv->tx_cfg.num_queues = MIN(priv->default_num_queues,
+		    priv->tx_cfg.num_queues);
+		priv->rx_cfg.num_queues = MIN(priv->default_num_queues,
+		    priv->rx_cfg.num_queues);
 	}
 
 	priv->num_queues = priv->tx_cfg.num_queues + priv->rx_cfg.num_queues;
@@ -622,19 +631,21 @@ gve_handle_reset(struct gve_priv *priv)
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_DO_RESET);
 	gve_set_state_flag(priv, GVE_STATE_FLAG_IN_RESET);
 
-	GVE_GLOBAL_LOCK_LOCK();
+	GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 
 	if_setdrvflagbits(priv->ifp, IFF_DRV_OACTIVE, IFF_DRV_RUNNING);
 	if_link_state_change(priv->ifp, LINK_STATE_DOWN);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 
-	/* Releasing the adminq causes the NIC to destroy all resources
+	/*
+	 * Releasing the adminq causes the NIC to destroy all resources
 	 * registered with it, so by clearing the flags beneath we cause
 	 * the subsequent gve_down call below to not attempt to tell the
 	 * NIC to destroy these resources again.
 	 *
 	 * The call to gve_down is needed in the first place to refresh
-	 * the state and the DMA-able memory within each driver ring. */
+	 * the state and the DMA-able memory within each driver ring.
+	 */
 	gve_release_adminq(priv);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_RESOURCES_OK);
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_QPLREG_OK);
@@ -644,7 +655,7 @@ gve_handle_reset(struct gve_priv *priv)
 	gve_down(priv);
 	gve_restore(priv);
 
-	GVE_GLOBAL_LOCK_UNLOCK();
+	GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 
 	priv->reset_cnt++;
 	gve_clear_state_flag(priv, GVE_STATE_FLAG_IN_RESET);
@@ -660,7 +671,8 @@ gve_handle_link_status(struct gve_priv *priv)
 		return;
 
 	if (link_up) {
-		device_printf(priv->dev, "Device link is up.\n");
+		if (bootverbose)
+			device_printf(priv->dev, "Device link is up.\n");
 		if_link_state_change(priv->ifp, LINK_STATE_UP);
 		gve_set_state_flag(priv, GVE_STATE_FLAG_LINK_UP);
 	} else {
@@ -677,7 +689,7 @@ gve_service_task(void *arg, int pending)
 	uint32_t status = gve_reg_bar_read_4(priv, DEVICE_STATUS);
 
 	if (((GVE_DEVICE_STATUS_RESET_MASK & status) != 0) &&
-	     !gve_get_state_flag(priv, GVE_STATE_FLAG_IN_RESET)) {
+	    !gve_get_state_flag(priv, GVE_STATE_FLAG_IN_RESET)) {
 		device_printf(priv->dev, "Device requested reset\n");
 		gve_set_state_flag(priv, GVE_STATE_FLAG_DO_RESET);
 	}
@@ -701,16 +713,16 @@ static void
 gve_free_sys_res_mem(struct gve_priv *priv)
 {
 	if (priv->msix_table != NULL)
-		bus_release_resource(priv->dev,
-		    SYS_RES_MEMORY, rman_get_rid(priv->msix_table), priv->msix_table);
+		bus_release_resource(priv->dev, SYS_RES_MEMORY,
+		    rman_get_rid(priv->msix_table), priv->msix_table);
 
 	if (priv->db_bar != NULL)
-		bus_release_resource(
-		    priv->dev, SYS_RES_MEMORY, rman_get_rid(priv->db_bar), priv->db_bar);
+		bus_release_resource(priv->dev, SYS_RES_MEMORY,
+		    rman_get_rid(priv->db_bar), priv->db_bar);
 
 	if (priv->reg_bar != NULL)
-		bus_release_resource(
-		    priv->dev, SYS_RES_MEMORY, rman_get_rid(priv->reg_bar), priv->reg_bar);
+		bus_release_resource(priv->dev, SYS_RES_MEMORY,
+		    rman_get_rid(priv->reg_bar), priv->reg_bar);
 }
 
 static int
@@ -722,13 +734,13 @@ gve_attach(device_t dev)
 
 	priv = device_get_softc(dev);
 	priv->dev = dev;
-	GVE_GLOBAL_LOCK_INIT();
+	GVE_IFACE_LOCK_INIT(priv->gve_iface_lock);
 
 	pci_enable_busmaster(dev);
 
 	rid = PCIR_BAR(GVE_REGISTER_BAR);
 	priv->reg_bar = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
-			    &rid, RF_ACTIVE);
+	    &rid, RF_ACTIVE);
 	if (priv->reg_bar == NULL) {
 		device_printf(dev, "Failed to allocate BAR0\n");
 		err = ENXIO;
@@ -737,7 +749,7 @@ gve_attach(device_t dev)
 
 	rid = PCIR_BAR(GVE_DOORBELL_BAR);
 	priv->db_bar = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
-			   &rid, RF_ACTIVE);
+	    &rid, RF_ACTIVE);
 	if (priv->db_bar == NULL) {
 		device_printf(dev, "Failed to allocate BAR2\n");
 		err = ENXIO;
@@ -746,7 +758,7 @@ gve_attach(device_t dev)
 
 	rid = pci_msix_table_bar(priv->dev);
 	priv->msix_table = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
-			       &rid, RF_ACTIVE);
+	    &rid, RF_ACTIVE);
 	if (priv->msix_table == NULL) {
 		device_printf(dev, "Failed to allocate msix table\n");
 		err = ENXIO;
@@ -776,14 +788,14 @@ gve_attach(device_t dev)
 
 	TASK_INIT(&priv->service_task, 0, gve_service_task, priv);
 	priv->service_tq = taskqueue_create("gve service", M_WAITOK | M_ZERO,
-			       taskqueue_thread_enqueue,
-			       &priv->service_tq);
+	    taskqueue_thread_enqueue, &priv->service_tq);
 	taskqueue_start_threads(&priv->service_tq, 1, PI_NET, "%s service tq",
 	    device_get_nameunit(priv->dev));
 
         gve_setup_sysctl(priv);
 
-        device_printf(priv->dev, "Successfully attached %s", GVE_DRIVER_VERSION);
+	if (bootverbose)
+		device_printf(priv->dev, "Successfully attached %s", GVE_DRIVER_VERSION);
 	return (0);
 
 abort:
@@ -791,7 +803,7 @@ abort:
 	gve_deconfigure_resources(priv);
 	gve_release_adminq(priv);
 	gve_free_sys_res_mem(priv);
-	GVE_GLOBAL_LOCK_DESTROY();
+	GVE_IFACE_LOCK_DESTROY(priv->gve_iface_lock);
 	return (err);
 }
 
@@ -803,13 +815,13 @@ gve_detach(device_t dev)
 
 	ether_ifdetach(ifp);
 
-	GVE_GLOBAL_LOCK_LOCK();
+	GVE_IFACE_LOCK_LOCK(priv->gve_iface_lock);
 	gve_destroy(priv);
-	GVE_GLOBAL_LOCK_UNLOCK();
+	GVE_IFACE_LOCK_UNLOCK(priv->gve_iface_lock);
 
 	gve_free_rings(priv);
 	gve_free_sys_res_mem(priv);
-	GVE_GLOBAL_LOCK_DESTROY();
+	GVE_IFACE_LOCK_DESTROY(priv->gve_iface_lock);
 
 	while (taskqueue_cancel(priv->service_tq, &priv->service_task, NULL))
 		taskqueue_drain(priv->service_tq, &priv->service_task);
@@ -839,5 +851,3 @@ DRIVER_MODULE(gve, pci, gve_driver, gve_devclass, 0, 0);
 #else
 DRIVER_MODULE(gve, pci, gve_driver, 0, 0);
 #endif
-
-MODULE_DEPEND(gve, linuxkpi, 1, 1, 1);

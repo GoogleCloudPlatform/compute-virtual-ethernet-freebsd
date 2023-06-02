@@ -34,11 +34,8 @@ set -ex
 SRCDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 DESTDIR="$SRCDIR"/build/
-if [ ! -d "$DESTDIR" ]; then
- mkdir "$DESTDIR";
-fi
-
-find "$DESTDIR" -type f -delete
+rm -rf "$DESTDIR"
+mkdir "$DESTDIR"
 
 cp "$SRCDIR"/*.c "$DESTDIR"/;
 cp "$SRCDIR"/*.h "$DESTDIR"/;

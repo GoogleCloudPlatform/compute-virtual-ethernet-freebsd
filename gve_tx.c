@@ -31,32 +31,20 @@
 #include "gve.h"
 #include "gve_adminq.h"
 
+#define GVE_GQ_TX_MIN_PKT_DESC_BYTES 182
+
 static int
-gve_tx_fifo_init(struct gve_priv *priv, struct gve_tx_fifo *fifo,
-    struct gve_queue_page_list *qpl)
+gve_tx_fifo_init(struct gve_priv *priv, struct gve_tx_ring *tx)
 {
-	fifo->base = vmap(qpl->pages, qpl->num_entries, VM_MAP, PAGE_KERNEL);
-	if (fifo->base == NULL) {
-		device_printf(priv->dev, "Failed to vmap fifo, qpl_id = %d\n",
-		    qpl->id);
-		return (ENOMEM);
-	}
+	struct gve_queue_page_list *qpl = tx->com.qpl;
+	struct gve_tx_fifo *fifo = &tx->fifo;
 
-	fifo->size = qpl->num_entries * PAGE_SIZE;
-	atomic_set(&fifo->available, fifo->size);
+	fifo->size = qpl->num_pages * PAGE_SIZE;
+	fifo->base = qpl->kva;
+	atomic_store_int(&fifo->available, fifo->size);
 	fifo->head = 0;
+
 	return (0);
-}
-
-static void
-gve_tx_fifo_release(struct gve_priv *priv, struct gve_tx_fifo *fifo)
-{
-	if (fifo->base == NULL)
-		return;
-
-	if (atomic_read(&fifo->available) != fifo->size)
-		device_printf(priv->dev, "Releasing non-empty fifo");
-	vunmap(fifo->base);
 }
 
 static void
@@ -81,12 +69,6 @@ gve_tx_free_ring(struct gve_priv *priv, int i)
 		tx->info = NULL;
 	}
 
-	/* Safe to call even if never allocated */
-	gve_tx_fifo_release(priv, &tx->fifo);
-
-	/* Safe to call even if never assigned */
-	gve_unassign_qpl(priv, com->qpl->id);
-
 	if (tx->desc_ring != NULL) {
 		gve_dma_free_coherent(&tx->desc_ring_mem);
 		tx->desc_ring = NULL;
@@ -109,36 +91,29 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 	com->priv = priv;
 	com->id = i;
 
-	com->qpl = gve_assign_tx_qpl(priv);
+	com->qpl = &priv->qpls[i];
 	if (com->qpl == NULL) {
-		device_printf(priv->dev, "No QPL left for tx ring %d", i);
+		device_printf(priv->dev, "No QPL left for tx ring %d\n", i);
 		return (ENOMEM);
 	}
-	err = gve_tx_fifo_init(priv, &tx->fifo, com->qpl);
+
+	err = gve_tx_fifo_init(priv, tx);
 	if (err != 0)
 		goto abort;
 
 	tx->info = malloc(sizeof(struct gve_tx_buffer_state) * priv->tx_desc_cnt,
-		       M_GVE, M_WAITOK | M_ZERO);
-	if (tx->info == NULL) {
-		device_printf(priv->dev, "Failed to alloc buf state array for tx ring %d", i);
-		goto abort;
-	}
+	    M_GVE, M_WAITOK | M_ZERO);
 
 	sprintf(mtx_name, "gvetx%d", i);
 	mtx_init(&tx->ring_mtx, mtx_name, NULL, MTX_DEF);
 
-	tx->br = buf_ring_alloc(GVE_TX_BUFRING_ENTRIES, M_DEVBUF, M_WAITOK, &tx->ring_mtx);
-	if (tx->br == NULL) {
-		device_printf(priv->dev, "Failed to alloc buf ring for tx ring %d", i);
-		goto abort;
-	}
+	tx->br = buf_ring_alloc(GVE_TX_BUFRING_ENTRIES, M_DEVBUF,
+	    M_WAITOK, &tx->ring_mtx);
 
 	gve_alloc_counters((counter_u64_t *)&tx->stats, NUM_TX_STATS);
 
 	err = gve_dma_alloc_coherent(priv, sizeof(struct gve_queue_resources),
-		  PAGE_SIZE, &com->q_resources_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    PAGE_SIZE, &com->q_resources_mem);
 	if (err != 0) {
 		device_printf(priv->dev, "Failed to alloc queue resources for tx ring %d", i);
 		goto abort;
@@ -146,9 +121,8 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 	com->q_resources = com->q_resources_mem.cpu_addr;
 
 	err = gve_dma_alloc_coherent(priv,
-		  sizeof(union gve_tx_desc) * priv->tx_desc_cnt,
-		  CACHE_LINE_SIZE, &tx->desc_ring_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    sizeof(union gve_tx_desc) * priv->tx_desc_cnt,
+	    CACHE_LINE_SIZE, &tx->desc_ring_mem);
 	if (err != 0) {
 		device_printf(priv->dev, "Failed to alloc desc ring for tx ring %d", i);
 		goto abort;
@@ -169,11 +143,7 @@ gve_alloc_tx_rings(struct gve_priv *priv)
 	int i;
 
 	priv->tx = malloc(sizeof(struct gve_tx_ring) * priv->tx_cfg.num_queues,
-		       M_GVE, M_NOWAIT | M_ZERO);
-	if (priv->tx == NULL) {
-		device_printf(priv->dev, "Failed to alloc tx ring array\n");
-		return (ENOMEM);
-	}
+	    M_GVE, M_WAITOK | M_ZERO);
 
 	for (i = 0; i < priv->tx_cfg.num_queues; i++) {
 		err = gve_tx_alloc_ring(priv, i);
@@ -227,7 +197,7 @@ gve_clear_tx_ring(struct gve_priv *priv, int i)
 	tx->done = 0;
 	tx->mask = priv->tx_desc_cnt - 1;
 
-	atomic_set(&fifo->available, fifo->size);
+	atomic_store_int(&fifo->available, fifo->size);
 	fifo->head = 0;
 
 	gve_tx_clear_desc_ring(tx);
@@ -241,13 +211,13 @@ gve_start_tx_ring(struct gve_priv *priv, int i)
 
 	NET_TASK_INIT(&com->cleanup_task, 0, gve_tx_cleanup_tq, tx);
 	com->cleanup_tq = taskqueue_create_fast("gve tx", M_WAITOK,
-			      taskqueue_thread_enqueue, &com->cleanup_tq);
+	    taskqueue_thread_enqueue, &com->cleanup_tq);
 	taskqueue_start_threads(&com->cleanup_tq, 1, PI_NET, "%s txq %d",
 	    device_get_nameunit(priv->dev), i);
 
 	TASK_INIT(&tx->xmit_task, 0, gve_xmit_tq, tx);
 	tx->xmit_tq = taskqueue_create_fast("gve tx xmit",
-		          M_WAITOK, taskqueue_thread_enqueue, &tx->xmit_tq);
+	    M_WAITOK, taskqueue_thread_enqueue, &tx->xmit_tq);
 	taskqueue_start_threads(&tx->xmit_tq, 1, PI_NET, "%s txq %d xmit",
 	    device_get_nameunit(priv->dev), i);
 }
@@ -336,7 +306,7 @@ gve_tx_intr(void *arg)
 	struct gve_priv *priv = tx->com.priv;
 	struct gve_ring_com *com = &tx->com;
 
-	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+	if (__predict_false((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
 		return (FILTER_STRAY);
 
 	gve_db_bar_write_4(priv, com->irq_db_offset, GVE_IRQ_MASK);
@@ -349,14 +319,14 @@ gve_tx_load_event_counter(struct gve_priv *priv, struct gve_tx_ring *tx)
 {
 	bus_dmamap_sync(priv->counter_array_mem.tag, priv->counter_array_mem.map,
 	    BUS_DMASYNC_POSTREAD);
-	__be32 counter = READ_ONCE(priv->counters[tx->com.counter_idx]);
+	uint32_t counter = priv->counters[tx->com.counter_idx];
 	return (be32toh(counter));
 }
 
 static void
 gve_tx_free_fifo(struct gve_tx_fifo *fifo, size_t bytes)
 {
-	atomic_add(bytes, &fifo->available);
+	atomic_add_int(&fifo->available, bytes);
 }
 
 void
@@ -369,7 +339,7 @@ gve_tx_cleanup_tq(void *arg, int pending)
 	size_t space_freed = 0;
 	int i, j;
 
-	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+	if (__predict_false((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
 		return;
 
 	for (j = 0; j < todo; j++) {
@@ -388,7 +358,7 @@ gve_tx_cleanup_tq(void *arg, int pending)
 		counter_exit();
 		m_freem(mbuf);
 
-		for (i = 0; i < ARRAY_SIZE(info->iov); i++) {
+		for (i = 0; i < GVE_TX_MAX_DESCS; i++) {
 			space_freed += info->iov[i].iov_len + info->iov[i].iov_padding;
 			info->iov[i].iov_len = 0;
 			info->iov[i].iov_padding = 0;
@@ -400,10 +370,11 @@ gve_tx_cleanup_tq(void *arg, int pending)
 	gve_db_bar_write_4(priv, tx->com.irq_db_offset,
 	    GVE_IRQ_ACK | GVE_IRQ_EVENT);
 
-	/* Completions born before this barrier MAY NOT cause the NIC to send an
+	/*
+	 * Completions born before this barrier MAY NOT cause the NIC to send an
 	 * interrupt but they will still be handled by the enqueue below.
 	 * Completions born after the barrier WILL trigger an interrupt.
-	 * */
+	 */
 	mb();
 
 	nic_done = gve_tx_load_event_counter(priv, tx);
@@ -433,8 +404,7 @@ static void
 gve_tx_fill_mtd_desc(struct gve_tx_mtd_desc *mtd_desc, struct mbuf *mbuf)
 {
 	mtd_desc->type_flags = GVE_TXD_MTD | GVE_MTD_SUBTYPE_PATH;
-	mtd_desc->path_state = GVE_MTD_PATH_STATE_DEFAULT |
-	    GVE_MTD_PATH_HASH_L4;
+	mtd_desc->path_state = GVE_MTD_PATH_STATE_DEFAULT | GVE_MTD_PATH_HASH_L4;
 	mtd_desc->path_hash = htobe32(mbuf->m_pkthdr.flowid);
 	mtd_desc->reserved0 = 0;
 	mtd_desc->reserved1 = 0;
@@ -442,9 +412,9 @@ gve_tx_fill_mtd_desc(struct gve_tx_mtd_desc *mtd_desc, struct mbuf *mbuf)
 
 static void
 gve_tx_fill_pkt_desc(struct gve_tx_pkt_desc *pkt_desc, bool is_tso,
-		     uint16_t l4_hdr_offset, uint32_t desc_cnt,
-		     uint16_t first_seg_len, uint64_t addr, bool has_csum_flag,
-		     int csum_offset, uint16_t pkt_len)
+    uint16_t l4_hdr_offset, uint32_t desc_cnt,
+    uint16_t first_seg_len, uint64_t addr, bool has_csum_flag,
+    int csum_offset, uint16_t pkt_len)
 {
 	if (is_tso) {
 		pkt_desc->type_flags = GVE_TXD_TSO | GVE_TXF_L4CSUM;
@@ -467,8 +437,8 @@ gve_tx_fill_pkt_desc(struct gve_tx_pkt_desc *pkt_desc, bool is_tso,
 
 static void
 gve_tx_fill_seg_desc(struct gve_tx_seg_desc *seg_desc,
-		     bool is_tso, uint16_t len, uint64_t addr,
-		     bool is_ipv6, uint8_t l3_off, uint16_t tso_mss)
+    bool is_tso, uint16_t len, uint64_t addr,
+    bool is_ipv6, uint8_t l3_off, uint16_t tso_mss)
 {
 	seg_desc->type_flags = GVE_TXD_SEG;
 	if (is_tso) {
@@ -490,7 +460,7 @@ gve_tx_avail(struct gve_tx_ring *tx)
 static bool
 gve_tx_fifo_can_alloc(struct gve_tx_fifo *fifo, size_t bytes)
 {
-	return atomic_read(&fifo->available) >= bytes;
+	return (atomic_load_int(&fifo->available) >= bytes);
 }
 
 static inline bool
@@ -507,14 +477,15 @@ gve_tx_fifo_pad_alloc_one_frag(struct gve_tx_fifo *fifo, size_t bytes)
 }
 
 static inline int
-gve_fifo_bytes_required(struct gve_tx_ring *tx, uint16_t first_seg_len, uint16_t pkt_len)
+gve_fifo_bytes_required(struct gve_tx_ring *tx, uint16_t first_seg_len,
+    uint16_t pkt_len)
 {
 	int pad_bytes, align_hdr_pad;
 	int bytes;
 
 	pad_bytes = gve_tx_fifo_pad_alloc_one_frag(&tx->fifo, first_seg_len);
 	/* We need to take into account the header alignment padding. */
-	align_hdr_pad = ALIGN(first_seg_len, CACHE_LINE_SIZE) - first_seg_len;
+	align_hdr_pad = roundup2(first_seg_len, CACHE_LINE_SIZE) - first_seg_len;
 	bytes = align_hdr_pad + pad_bytes + pkt_len;
 
 	return (bytes);
@@ -522,7 +493,7 @@ gve_fifo_bytes_required(struct gve_tx_ring *tx, uint16_t first_seg_len, uint16_t
 
 static int
 gve_tx_alloc_fifo(struct gve_tx_fifo *fifo, size_t bytes,
-		  struct gve_tx_iovec iov[2])
+    struct gve_tx_iovec iov[2])
 {
 	size_t overflow, padding;
 	uint32_t aligned_head;
@@ -531,14 +502,15 @@ gve_tx_alloc_fifo(struct gve_tx_fifo *fifo, size_t bytes,
 	if (bytes == 0)
 		return (0);
 
-	/* This check happens before we know how much padding is needed to
+	/*
+	 * This check happens before we know how much padding is needed to
 	 * align to a cacheline boundary for the payload, but that is fine,
 	 * because the FIFO head always start aligned, and the FIFO's boundaries
 	 * are aligned, so if there is space for the data, there is space for
 	 * the padding to the next alignment.
 	 */
-	WARN(!gve_tx_fifo_can_alloc(fifo, bytes),
-	    "Reached %s when there's not enough space in the fifo", __func__);
+	KASSERT(gve_tx_fifo_can_alloc(fifo, bytes),
+	    ("Allocating gve tx fifo when there is no room"));
 
 	nfrags++;
 
@@ -547,7 +519,8 @@ gve_tx_alloc_fifo(struct gve_tx_fifo *fifo, size_t bytes,
 	fifo->head += bytes;
 
 	if (fifo->head > fifo->size) {
-		/* If the allocation did not fit in the tail fragment of the
+		/*
+		 * If the allocation did not fit in the tail fragment of the
 		 * FIFO, also use the head fragment.
 		 */
 		nfrags++;
@@ -560,10 +533,10 @@ gve_tx_alloc_fifo(struct gve_tx_fifo *fifo, size_t bytes,
 	}
 
 	/* Re-align to a cacheline boundary */
-	aligned_head = ALIGN(fifo->head, CACHE_LINE_SIZE);
+	aligned_head = roundup2(fifo->head, CACHE_LINE_SIZE);
 	padding = aligned_head - fifo->head;
 	iov[nfrags - 1].iov_padding = padding;
-	atomic_sub(bytes + padding, &fifo->available);
+	atomic_add_int(&fifo->available, -(bytes + padding));
 	fifo->head = aligned_head;
 
 	if (fifo->head == fifo->size)
@@ -576,70 +549,83 @@ gve_tx_alloc_fifo(struct gve_tx_fifo *fifo, size_t bytes,
 static int
 gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 {
+	bool is_tso, has_csum_flag, is_ipv6 = false, is_tcp = false, is_udp = false;
 	int csum_flags, csum_offset, mtd_desc_nr, offset, copy_offset;
 	uint16_t tso_mss, l4_off, l4_data_off, pkt_len, first_seg_len;
 	int pad_bytes, hdr_nfrags, payload_nfrags;
-	bool is_tso, has_csum_flag, is_ipv6;
 	struct gve_tx_pkt_desc *pkt_desc;
 	struct gve_tx_seg_desc *seg_desc;
 	struct gve_tx_mtd_desc *mtd_desc;
 	struct gve_tx_buffer_state *info;
 	uint32_t idx = tx->req & tx->mask;
-	struct ether_vlan_header *eh;
+	struct ether_header *eh;
 	struct mbuf *mbuf_next;
 	int payload_iov = 2;
 	int bytes_required;
+	struct ip6_hdr *ip6;
 	struct tcphdr *th;
-	struct ip *ip;
 	uint32_t next_idx;
 	uint8_t l3_off;
+	struct ip *ip;
 	int i;
 
 	info = &tx->info[idx];
 	csum_flags = mbuf->m_pkthdr.csum_flags;
 	pkt_len = mbuf->m_pkthdr.len;
 	is_tso = csum_flags & CSUM_TSO;
-	has_csum_flag = csum_flags & (CSUM_TCP | CSUM_UDP);
+	has_csum_flag = csum_flags & (CSUM_TCP | CSUM_UDP |
+	    CSUM_IP6_TCP | CSUM_IP6_UDP | CSUM_TSO);
 	mtd_desc_nr = M_HASHTYPE_GET(mbuf) != M_HASHTYPE_NONE ? 1 : 0;
 	tso_mss = is_tso ? mbuf->m_pkthdr.tso_segsz : 0;
 
-	eh = mtod(mbuf, struct ether_vlan_header *);
-	is_ipv6 = ntohs(eh->evl_proto) == ETHERTYPE_IPV6;
-	if (eh->evl_encap_proto == htons(ETHERTYPE_VLAN))
-		l3_off = ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN;
-	else
-		l3_off = ETHER_HDR_LEN;
+	eh = mtod(mbuf, struct ether_header *);
+	KASSERT(eh->ether_type != ETHERTYPE_VLAN,
+	    ("VLAN-tagged packets not supported"));
 
+	is_ipv6 = ntohs(eh->ether_type) == ETHERTYPE_IPV6;
+	l3_off = ETHER_HDR_LEN;
 	mbuf_next = m_getptr(mbuf, l3_off, &offset);
-	ip = (struct ip *)(mtodo(mbuf_next, offset));
-	l4_off = l3_off + (ip->ip_hl << 2);
 
-	l4_data_off = 0;
-	mbuf_next = m_getptr(mbuf, l4_off, &offset);
-	if (ip->ip_p == IPPROTO_TCP) {
-		th = (struct tcphdr *)(mtodo(mbuf_next, offset));
-		l4_data_off = l4_off + (th->th_off << 2);
-	} else if (ip->ip_p == IPPROTO_UDP) {
-		l4_data_off = l4_off + sizeof(struct udphdr);
+	if (is_ipv6) {
+		ip6 = (struct ip6_hdr *)(mtodo(mbuf_next, offset));
+		l4_off = l3_off + sizeof(struct ip6_hdr);
+		is_tcp = (ip6->ip6_nxt == IPPROTO_TCP);
+		is_udp = (ip6->ip6_nxt == IPPROTO_UDP);
+		mbuf_next = m_getptr(mbuf, l4_off, &offset);
+	} else if (ntohs(eh->ether_type) == ETHERTYPE_IP) {
+		ip = (struct ip *)(mtodo(mbuf_next, offset));
+		l4_off = l3_off + (ip->ip_hl << 2);
+		is_tcp = (ip->ip_p == IPPROTO_TCP);
+		is_udp = (ip->ip_p == IPPROTO_UDP);
+		mbuf_next = m_getptr(mbuf, l4_off, &offset);
 	}
 
+	l4_data_off = 0;
+	if (is_tcp) {
+		th = (struct tcphdr *)(mtodo(mbuf_next, offset));
+		l4_data_off = l4_off + (th->th_off << 2);
+	} else if (is_udp)
+		l4_data_off = l4_off + sizeof(struct udphdr);
+
 	if (has_csum_flag) {
-		if ((csum_flags & CSUM_TCP) != 0)
+		if ((csum_flags & (CSUM_TSO | CSUM_TCP | CSUM_IP6_TCP)) != 0)
 			csum_offset = offsetof(struct tcphdr, th_sum);
 		else
 			csum_offset = offsetof(struct udphdr, uh_sum);
 	}
 
-	/* If this packet is neither a TCP nor a UDP packet, the first segment,
+	/*
+	 * If this packet is neither a TCP nor a UDP packet, the first segment,
 	 * the one represented by the packet descriptor, will carry the
-	 * spec-stipulated minimum of 182B. */
+	 * spec-stipulated minimum of 182B.
+	 */
 	if (l4_data_off != 0)
 		first_seg_len = l4_data_off;
 	else
-		first_seg_len = min_t(uint16_t, pkt_len, 182);
+		first_seg_len = MIN(pkt_len, GVE_GQ_TX_MIN_PKT_DESC_BYTES);
 
 	bytes_required = gve_fifo_bytes_required(tx, first_seg_len, pkt_len);
-	if (unlikely(!gve_can_tx(tx, bytes_required))) {
+	if (__predict_false(!gve_can_tx(tx, bytes_required))) {
 		counter_enter();
 		counter_u64_add_protected(tx->stats.tx_dropped_pkt_nospace_device, 1);
 		counter_u64_add_protected(tx->stats.tx_dropped_pkt, 1);
@@ -650,15 +636,16 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 	/* So that the cleanup taskqueue can free the mbuf eventually. */
 	info->mbuf = mbuf;
 
-	/* We don't want to split the header, so if necessary, pad to the end
+	/*
+	 * We don't want to split the header, so if necessary, pad to the end
 	 * of the fifo and then put the header at the beginning of the fifo.
 	 */
 	pad_bytes = gve_tx_fifo_pad_alloc_one_frag(&tx->fifo, first_seg_len);
 	hdr_nfrags = gve_tx_alloc_fifo(&tx->fifo, first_seg_len + pad_bytes,
-		         &info->iov[0]);
-	WARN(!hdr_nfrags, "hdr_nfrags should never be 0!");
+	    &info->iov[0]);
+	KASSERT(hdr_nfrags > 0, ("Number of header fragments for gve tx is 0"));
 	payload_nfrags = gve_tx_alloc_fifo(&tx->fifo, pkt_len - first_seg_len,
-			     &info->iov[payload_iov]);
+	    &info->iov[payload_iov]);
 
 	pkt_desc = &tx->desc_ring[idx].pkt;
 	gve_tx_fill_pkt_desc(pkt_desc, is_tso, l4_off,
@@ -667,7 +654,7 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 	    pkt_len);
 
 	m_copydata(mbuf, 0, first_seg_len,
-	    (char*)tx->fifo.base + info->iov[hdr_nfrags - 1].iov_offset);
+	    (char *)tx->fifo.base + info->iov[hdr_nfrags - 1].iov_offset);
 	gve_dma_sync_for_device(tx->com.qpl,
 	    info->iov[hdr_nfrags - 1].iov_offset,
 	    info->iov[hdr_nfrags - 1].iov_len);
@@ -687,7 +674,7 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 		    info->iov[i].iov_offset, is_ipv6, l3_off, tso_mss);
 
 		m_copydata(mbuf, copy_offset, info->iov[i].iov_len,
-		    (char*)tx->fifo.base + info->iov[i].iov_offset);
+		    (char *)tx->fifo.base + info->iov[i].iov_offset);
 		gve_dma_sync_for_device(tx->com.qpl,
 		    info->iov[i].iov_offset, info->iov[i].iov_len);
 		copy_offset += info->iov[i].iov_len;
@@ -710,10 +697,10 @@ gve_xmit_br(struct gve_tx_ring *tx)
 	struct mbuf *mbuf;
 
 	while (!drbr_empty(ifp, tx->br) &&
-	       (if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0) {
+	    (if_getdrvflags(ifp) & IFF_DRV_RUNNING) != 0) {
 
 		mbuf = drbr_peek(ifp, tx->br);
-		if (unlikely(gve_xmit(tx, mbuf) != 0)) {
+		if (__predict_false(gve_xmit(tx, mbuf) != 0)) {
 			drbr_putback(ifp, tx->br, mbuf);
 			taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 			break;
@@ -738,16 +725,25 @@ gve_xmit_tq(void *arg, int pending)
 	GVE_RING_UNLOCK(tx);
 }
 
+static bool
+is_vlan_tagged_pkt(struct mbuf *mbuf)
+{
+	struct ether_header *eh;
+
+	eh = mtod(mbuf, struct ether_header *);
+	return (ntohs(eh->ether_type) == ETHERTYPE_VLAN);
+}
+
 int
 gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 {
-	struct gve_priv *priv = ifp->if_softc;
+	struct gve_priv *priv = if_getsoftc(ifp);
 	struct gve_tx_ring *tx;
 	bool is_br_empty;
 	int err;
 	uint32_t i;
 
-	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+	if (__predict_false((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
 		return (ENODEV);
 
 	if (M_HASHTYPE_GET(mbuf) != M_HASHTYPE_NONE)
@@ -756,9 +752,18 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 		i = curcpu % priv->tx_cfg.num_queues;
 	tx = &priv->tx[i];
 
+	if (__predict_false(is_vlan_tagged_pkt(mbuf))) {
+		counter_enter();
+		counter_u64_add_protected(tx->stats.tx_dropped_pkt_vlan, 1);
+		counter_u64_add_protected(tx->stats.tx_dropped_pkt, 1);
+		counter_exit();
+		m_freem(mbuf);
+		return (ENODEV);
+	}
+
 	is_br_empty = drbr_empty(ifp, tx->br);
 	err = drbr_enqueue(ifp, tx->br, mbuf);
-	if (unlikely(err != 0)) {
+	if (__predict_false(err != 0)) {
 		taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 		counter_enter();
 		counter_u64_add_protected(tx->stats.tx_dropped_pkt_nospace_bufring, 1);
@@ -767,8 +772,10 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 		return (err);
 	}
 
-	/* If the mbuf we just enqueued is the only one on the ring, then
-	 * transmit it right away in the interests of low latency. */
+	/*
+	 * If the mbuf we just enqueued is the only one on the ring, then
+	 * transmit it right away in the interests of low latency.
+	 */
 	if (is_br_empty && (GVE_RING_TRYLOCK(tx) != 0)) {
 		gve_xmit_br(tx);
 		GVE_RING_UNLOCK(tx);
@@ -782,11 +789,11 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 void
 gve_qflush(if_t ifp)
 {
-	struct gve_priv *priv = ifp->if_softc;
+	struct gve_priv *priv = if_getsoftc(ifp);
 	struct gve_tx_ring *tx;
 	int i;
 
-	for(i = 0; i < priv->tx_cfg.num_queues; ++i) {
+	for (i = 0; i < priv->tx_cfg.num_queues; ++i) {
 		tx = &priv->tx[i];
 		if (drbr_empty(ifp, tx->br) == 0) {
 			GVE_RING_LOCK(tx);

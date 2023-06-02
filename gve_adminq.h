@@ -79,7 +79,8 @@ enum gve_adminq_statuses {
 
 #define GVE_ADMINQ_DEVICE_DESCRIPTOR_VERSION 1
 
-/* All AdminQ command structs should be naturally packed. The static_assert
+/*
+ * All AdminQ command structs should be naturally packed. The static_assert
  * calls make sure this is the case at compile time.
  */
 
@@ -89,7 +90,8 @@ struct gve_adminq_describe_device {
 	__be32 available_length;
 };
 
-static_assert(sizeof(struct gve_adminq_describe_device) == 16);
+_Static_assert(sizeof(struct gve_adminq_describe_device) == 16,
+    "gve: bad admin queue struct length");
 
 struct gve_device_descriptor {
 	__be64 max_registered_pages;
@@ -101,13 +103,14 @@ struct gve_device_descriptor {
 	__be16 counters;
 	__be16 reserved2;
 	__be16 rx_pages_per_qpl;
-	uint8_t  mac[ETH_ALEN];
+	uint8_t  mac[ETHER_ADDR_LEN];
 	__be16 num_device_options;
 	__be16 total_length;
 	uint8_t  reserved3[6];
 };
 
-static_assert(sizeof(struct gve_device_descriptor) == 40);
+_Static_assert(sizeof(struct gve_device_descriptor) == 40,
+    "gve: bad admin queue struct length");
 
 struct gve_device_option {
 	__be16 option_id;
@@ -115,25 +118,29 @@ struct gve_device_option {
 	__be32 required_features_mask;
 };
 
-static_assert(sizeof(struct gve_device_option) == 8);
+_Static_assert(sizeof(struct gve_device_option) == 8,
+    "gve: bad admin queue struct length");
 
 struct gve_device_option_gqi_rda {
 	__be32 supported_features_mask;
 };
 
-static_assert(sizeof(struct gve_device_option_gqi_rda) == 4);
+_Static_assert(sizeof(struct gve_device_option_gqi_rda) == 4,
+    "gve: bad admin queue struct length");
 
 struct gve_device_option_gqi_qpl {
 	__be32 supported_features_mask;
 };
 
-static_assert(sizeof(struct gve_device_option_gqi_qpl) == 4);
+_Static_assert(sizeof(struct gve_device_option_gqi_qpl) == 4,
+    "gve: bad admin queue struct length");
 
 struct gve_device_option_dqo_rda {
 	__be32 supported_features_mask;
 };
 
-static_assert(sizeof(struct gve_device_option_dqo_rda) == 4);
+_Static_assert(sizeof(struct gve_device_option_dqo_rda) == 4,
+    "gve: bad admin queue struct length");
 
 struct gve_device_option_modify_ring {
 	__be32 supported_features_mask;
@@ -141,7 +148,8 @@ struct gve_device_option_modify_ring {
 	__be16 max_tx_ring_size;
 };
 
-static_assert(sizeof(struct gve_device_option_modify_ring) == 8);
+_Static_assert(sizeof(struct gve_device_option_modify_ring) == 8,
+    "gve: bad admin queue struct length");
 
 struct gve_device_option_jumbo_frames {
 	__be32 supported_features_mask;
@@ -149,7 +157,8 @@ struct gve_device_option_jumbo_frames {
 	uint8_t padding[2];
 };
 
-static_assert(sizeof(struct gve_device_option_jumbo_frames) == 8);
+_Static_assert(sizeof(struct gve_device_option_jumbo_frames) == 8,
+    "gve: bad admin queue struct length");
 
 enum gve_dev_opt_id {
 	GVE_DEV_OPT_ID_GQI_RAW_ADDRESSING = 0x1,
@@ -160,10 +169,12 @@ enum gve_dev_opt_id {
 	GVE_DEV_OPT_ID_JUMBO_FRAMES = 0x8,
 };
 
-/* These masks are way to predicate the use of a particular option on the driver
+/*
+ * These masks are way to predicate the use of a particular option on the driver
  * having particular bug fixes represented by each bit position in the mask.
  * Currently they are all zero because there are no known bugs preventing the
- * use of any option. */
+ * use of any option.
+ */
 enum gve_dev_opt_req_feat_mask {
 	GVE_DEV_OPT_REQ_FEAT_MASK_GQI_RAW_ADDRESSING = 0x0,
 	GVE_DEV_OPT_REQ_FEAT_MASK_GQI_RDA = 0x0,
@@ -193,9 +204,11 @@ enum gve_driver_capability {
 #define GVE_CAP3(a) BIT(((int) a) - 128)
 #define GVE_CAP4(a) BIT(((int) a) - 192)
 
-/* The following four defines describe 256 compatibility bits.
+/*
+ * The following four defines describe 256 compatibility bits.
  * Only a few bits (as shown in `gve_driver_compatibility`) are currently
- * defined. The rest are reserved for future use. */
+ * defined. The rest are reserved for future use.
+ */
 #define GVE_DRIVER_CAPABILITY_FLAGS1 (GVE_CAP1(gve_driver_capability_gqi_qpl))
 #define GVE_DRIVER_CAPABILITY_FLAGS2 0x0
 #define GVE_DRIVER_CAPABILITY_FLAGS3 0x0
@@ -219,7 +232,8 @@ struct gve_adminq_verify_driver_compatibility {
 	__be64 driver_info_addr;
 };
 
-static_assert(sizeof(struct gve_adminq_verify_driver_compatibility) == 16);
+_Static_assert(sizeof(struct gve_adminq_verify_driver_compatibility) == 16,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_configure_device_resources {
 	__be64 counter_array;
@@ -232,7 +246,8 @@ struct gve_adminq_configure_device_resources {
 	uint8_t padding[7];
 };
 
-static_assert(sizeof(struct gve_adminq_configure_device_resources) == 40);
+_Static_assert(sizeof(struct gve_adminq_configure_device_resources) == 40,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_register_page_list {
 	__be32 page_list_id;
@@ -241,13 +256,15 @@ struct gve_adminq_register_page_list {
 	__be64 page_size;
 };
 
-static_assert(sizeof(struct gve_adminq_register_page_list) == 24);
+_Static_assert(sizeof(struct gve_adminq_register_page_list) == 24,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_unregister_page_list {
 	__be32 page_list_id;
 };
 
-static_assert(sizeof(struct gve_adminq_unregister_page_list) == 4);
+_Static_assert(sizeof(struct gve_adminq_unregister_page_list) == 4,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_create_tx_queue {
 	__be32 queue_id;
@@ -262,7 +279,8 @@ struct gve_adminq_create_tx_queue {
 	uint8_t padding[4];
 };
 
-static_assert(sizeof(struct gve_adminq_create_tx_queue) == 48);
+_Static_assert(sizeof(struct gve_adminq_create_tx_queue) == 48,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_create_rx_queue {
 	__be32 queue_id;
@@ -280,7 +298,8 @@ struct gve_adminq_create_rx_queue {
 	uint8_t padding[5];
 };
 
-static_assert(sizeof(struct gve_adminq_create_rx_queue) == 56);
+_Static_assert(sizeof(struct gve_adminq_create_rx_queue) == 56,
+    "gve: bad admin queue struct length");
 
 /* Queue resources that are shared with the device */
 struct gve_queue_resources {
@@ -293,19 +312,22 @@ struct gve_queue_resources {
 	};
 };
 
-static_assert(sizeof(struct gve_queue_resources) == 64);
+_Static_assert(sizeof(struct gve_queue_resources) == 64,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_destroy_tx_queue {
 	__be32 queue_id;
 };
 
-static_assert(sizeof(struct gve_adminq_destroy_tx_queue) == 4);
+_Static_assert(sizeof(struct gve_adminq_destroy_tx_queue) == 4,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_destroy_rx_queue {
 	__be32 queue_id;
 };
 
-static_assert(sizeof(struct gve_adminq_destroy_rx_queue) == 4);
+_Static_assert(sizeof(struct gve_adminq_destroy_rx_queue) == 4,
+    "gve: bad admin queue struct length");
 
 /* GVE Set Driver Parameter Types */
 enum gve_set_driver_param_types {
@@ -318,7 +340,8 @@ struct gve_adminq_set_driver_parameter {
 	__be64 parameter_value;
 };
 
-static_assert(sizeof(struct gve_adminq_set_driver_parameter) == 16);
+_Static_assert(sizeof(struct gve_adminq_set_driver_parameter) == 16,
+    "gve: bad admin queue struct length");
 
 struct stats {
 	__be32 stat_name;
@@ -326,7 +349,8 @@ struct stats {
 	__be64 value;
 };
 
-static_assert(sizeof(struct stats) == 16);
+_Static_assert(sizeof(struct stats) == 16,
+    "gve: bad admin queue struct length");
 
 struct gve_adminq_command {
 	__be32 opcode;
@@ -348,7 +372,8 @@ struct gve_adminq_command {
 	};
 };
 
-static_assert(sizeof(struct gve_adminq_command) == 64);
+_Static_assert(sizeof(struct gve_adminq_command) == 64,
+    "gve: bad admin queue struct length");
 
 int gve_adminq_create_rx_queues(struct gve_priv *priv, uint32_t num_queues);
 int gve_adminq_create_tx_queues(struct gve_priv *priv, uint32_t num_queues);
@@ -365,5 +390,5 @@ int gve_adminq_register_page_list(struct gve_priv *priv,
         struct gve_queue_page_list *qpl);
 int gve_adminq_unregister_page_list(struct gve_priv *priv, uint32_t page_list_id);
 int gve_adminq_verify_driver_compatibility(struct gve_priv *priv,
-        uint64_t driver_info_len, dma_addr_t driver_info_addr);
+        uint64_t driver_info_len, vm_paddr_t driver_info_addr);
 #endif /* _GVE_AQ_H_ */

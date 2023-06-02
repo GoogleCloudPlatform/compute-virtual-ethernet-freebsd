@@ -49,11 +49,12 @@
 
 #define ADMINQ_SIZE PAGE_SIZE
 
+#define GVE_DEFAULT_RX_BUFFER_SIZE 2048
 /* Each RX bounce buffer page can fit two packet buffers. */
-#define GVE_DEFAULT_RX_BUFFER_SIZE (PAGE_SIZE / 2)
 #define GVE_DEFAULT_RX_BUFFER_OFFSET (PAGE_SIZE / 2)
 
-/* Number of descriptors per queue page list.
+/*
+ * Number of descriptors per queue page list.
  * Page count AKA QPL size can be derived by dividing the number of elements in
  * a page by the number of descriptors available.
  */
@@ -66,7 +67,6 @@ struct gve_dma_handle {
 	void		*cpu_addr;
 	bus_dma_tag_t	tag;
 	bus_dmamap_t	map;
-	int		size;
 };
 
 union gve_tx_desc {
@@ -88,18 +88,12 @@ struct gve_queue_config {
 	uint16_t num_queues; /* current */
 };
 
-/* Tracks the available and used qpl IDs */
-struct gve_qpl_config {
-	uint32_t qpl_map_size; /* map memory size */
-	unsigned long *qpl_id_map; /* bitmap of used qpl ids */
-};
-
 struct gve_irq_db {
 	__be32 index;
-} ____cacheline_aligned;
+} __aligned(CACHE_LINE_SIZE);
 
-
-/* GVE_QUEUE_FORMAT_UNSPECIFIED must be zero since 0 is the default value
+/*
+ * GVE_QUEUE_FORMAT_UNSPECIFIED must be zero since 0 is the default value
  * when the entire configure_device_resources command is zeroed out and the
  * queue_format is not specified.
  */
@@ -111,16 +105,19 @@ enum gve_queue_format {
 };
 
 enum gve_state_flags_bit {
-	GVE_STATE_FLAG_ADMINQ_OK = 1,
-	GVE_STATE_FLAG_RESOURCES_OK = 2,
-	GVE_STATE_FLAG_QPLREG_OK = 3,
-	GVE_STATE_FLAG_RX_RINGS_OK = 4,
-	GVE_STATE_FLAG_TX_RINGS_OK = 5,
-	GVE_STATE_FLAG_QUEUES_UP = 6,
-	GVE_STATE_FLAG_LINK_UP = 7,
-	GVE_STATE_FLAG_DO_RESET = 8,
-	GVE_STATE_FLAG_IN_RESET = 9,
+	GVE_STATE_FLAG_ADMINQ_OK,
+	GVE_STATE_FLAG_RESOURCES_OK,
+	GVE_STATE_FLAG_QPLREG_OK,
+	GVE_STATE_FLAG_RX_RINGS_OK,
+	GVE_STATE_FLAG_TX_RINGS_OK,
+	GVE_STATE_FLAG_QUEUES_UP,
+	GVE_STATE_FLAG_LINK_UP,
+	GVE_STATE_FLAG_DO_RESET,
+	GVE_STATE_FLAG_IN_RESET,
+	GVE_NUM_STATE_FLAGS /* Not part of the enum space */
 };
+
+BITSET_DEFINE(gve_state_flags, GVE_NUM_STATE_FLAGS);
 
 #define GVE_DEVICE_STATUS_RESET (0x1 << 1)
 #define GVE_DEVICE_STATUS_LINK_STATUS (0x1 << 2)
@@ -130,18 +127,18 @@ enum gve_state_flags_bit {
 #define GVE_RING_UNLOCK(ring)	mtx_unlock(&(ring)->ring_mtx)
 #define GVE_RING_ASSERT(ring)	mtx_assert(&(ring)->ring_mtx, MA_OWNED)
 
-#define GVE_GLOBAL_LOCK_INIT()	sx_init(&gve_global_lock, "gve global lock")
-#define GVE_GLOBAL_LOCK_DESTROY() sx_destroy(&gve_global_lock)
-#define GVE_GLOBAL_LOCK_LOCK() sx_xlock(&gve_global_lock)
-#define GVE_GLOBAL_LOCK_UNLOCK() sx_unlock(&gve_global_lock)
-#define GVE_GLOBAL_LOCK_ASSERT() sx_assert(&gve_global_lock, SA_XLOCKED)
-
-extern struct sx gve_global_lock;
+#define GVE_IFACE_LOCK_INIT(lock)     sx_init(&lock, "gve interface lock")
+#define GVE_IFACE_LOCK_DESTROY(lock)  sx_destroy(&lock)
+#define GVE_IFACE_LOCK_LOCK(lock)     sx_xlock(&lock)
+#define GVE_IFACE_LOCK_UNLOCK(lock)   sx_unlock(&lock)
+#define GVE_IFACE_LOCK_ASSERT(lock)   sx_assert(&lock, SA_XLOCKED)
 
 struct gve_queue_page_list {
 	uint32_t id;
-	uint32_t num_entries;
-	struct page **pages;
+	uint32_t num_dmas;
+	uint32_t num_pages;
+	vm_offset_t kva;
+	vm_page_t *pages;
 	struct gve_dma_handle *dmas;
 };
 
@@ -152,12 +149,13 @@ struct gve_irq {
 
 struct gve_rx_slot_page_info {
 	void *page_address;
+	vm_page_t page;
 	uint32_t page_offset;
 	uint16_t pad;
-	uint8_t can_flip;
 };
 
-/* A single received packet split across multiple buffers may be
+/*
+ * A single received packet split across multiple buffers may be
  * reconstructed using the information in this structure.
  */
 struct gve_rx_ctx {
@@ -173,10 +171,12 @@ struct gve_ring_com {
 	struct gve_priv *priv;
 	uint32_t id;
 
-	/* BAR2 offset for this ring's doorbell and the
+	/*
+	 * BAR2 offset for this ring's doorbell and the
 	 * counter-array offset for this ring's counter.
 	 * Acquired from the device individually for each
-	 * queue in the queue_create adminq command. */
+	 * queue in the queue_create adminq command.
+	 */
 	struct gve_queue_resources *q_resources;
 	struct gve_dma_handle q_resources_mem;
 
@@ -184,11 +184,14 @@ struct gve_ring_com {
 	uint32_t irq_db_offset;
 	/* Byte offset into BAR2 where this ring's 4-byte doorbell lies. */
 	uint32_t db_offset;
-	/* Index, not byte-offset, into the counter array where this ring's
-	 * 4-byte counter lies. */
+	/*
+	 * Index, not byte-offset, into the counter array where this ring's
+	 * 4-byte counter lies.
+	 */
 	uint32_t counter_idx;
 
-	/* The index of the MSIX vector that was assigned to
+	/*
+	 * The index of the MSIX vector that was assigned to
 	 * this ring in `gve_alloc_irqs`.
 	 *
 	 * It is passed to the device in the queue_create adminq
@@ -196,12 +199,15 @@ struct gve_ring_com {
 	 *
 	 * Additionally, this also serves as the index into
 	 * `priv->irq_db_indices` where this ring's irq doorbell's
-	 * BAR2 offset, `irq_db_idx`, can be found.*/
+	 * BAR2 offset, `irq_db_idx`, can be found.
+	 */
 	int ntfy_id;
 
-	/* The fixed bounce buffer for this ring.
+	/*
+	 * The fixed bounce buffer for this ring.
 	 * Once allocated, has to be offered to the device
-	 * over the register-page-list adminq command. */
+	 * over the register-page-list adminq command.
+	 */
 	struct gve_queue_page_list *qpl;
 
 	struct task cleanup_task;
@@ -244,15 +250,17 @@ struct gve_rx_ring {
 
 } __aligned(CACHE_LINE_SIZE);
 
-/* A contiguous representation of the pages composing the Tx bounce buffer.
+/*
+ * A contiguous representation of the pages composing the Tx bounce buffer.
  * The xmit taskqueue and the completion taskqueue both simultaneously use it.
  * Both operate on `available`: the xmit tq lowers it and the completion tq
  * raises it. `head` is the last location written at and so only the xmit tq
- * uses it. */
+ * uses it.
+ */
 struct gve_tx_fifo {
-	void *base; /* address of base of FIFO */
+	vm_offset_t base; /* address of base of FIFO */
 	uint32_t size; /* total size */
-	atomic_t available; /* how much space is still available */
+	volatile int available; /* how much space is still available */
 	uint32_t head; /* offset to write at */
 };
 
@@ -268,6 +276,7 @@ struct gve_txq_stats {
 	counter_u64_t tx_dropped_pkt;
 	counter_u64_t tx_dropped_pkt_nospace_device;
 	counter_u64_t tx_dropped_pkt_nospace_bufring;
+	counter_u64_t tx_dropped_pkt_vlan;
 };
 
 #define NUM_TX_STATS (sizeof(struct gve_txq_stats) / sizeof(counter_u64_t))
@@ -332,17 +341,18 @@ struct gve_priv {
 	struct gve_queue_page_list *qpls;
 	struct gve_queue_config tx_cfg;
 	struct gve_queue_config rx_cfg;
-	struct gve_qpl_config qpl_cfg;
 	uint32_t num_queues;
 
 	struct gve_irq *irq_tbl;
 	struct gve_tx_ring *tx;
 	struct gve_rx_ring *rx;
 
-	/* Admin queue - see gve_adminq.h
-	 * Since AQ cmds do not run in steady state, 32 bit counters suffice */
+	/*
+	 * Admin queue - see gve_adminq.h
+	 * Since AQ cmds do not run in steady state, 32 bit counters suffice
+	 */
 	struct gve_adminq_command *adminq;
-	dma_addr_t adminq_bus_addr;
+	vm_paddr_t adminq_bus_addr;
 	uint32_t adminq_mask; /* masks prod_cnt to adminq size */
 	uint32_t adminq_prod_cnt; /* free-running count of AQ cmds executed */
 	uint32_t adminq_cmd_fail; /* free-running count of AQ cmds failed */
@@ -360,30 +370,33 @@ struct gve_priv {
 	uint32_t adminq_set_driver_parameter_cnt;
 	uint32_t adminq_verify_driver_compatibility_cnt;
 
+	uint32_t interface_up_cnt;
+	uint32_t interface_down_cnt;
 	uint32_t reset_cnt;
 
 	struct task service_task;
 	struct taskqueue *service_tq;
 
-	unsigned long state_flags;
+	struct gve_state_flags state_flags;
+	struct sx gve_iface_lock;
 };
 
 static inline bool
 gve_get_state_flag(struct gve_priv *priv, int pos)
 {
-	return (test_bit(pos, &priv->state_flags));
+	return (BIT_ISSET(GVE_NUM_STATE_FLAGS, pos, &priv->state_flags));
 }
 
 static inline void
 gve_set_state_flag(struct gve_priv *priv, int pos)
 {
-	set_bit(pos, &priv->state_flags);
+	BIT_SET_ATOMIC(GVE_NUM_STATE_FLAGS, pos, &priv->state_flags);
 }
 
 static inline void
 gve_clear_state_flag(struct gve_priv *priv, int pos)
 {
-	clear_bit(pos, &priv->state_flags);
+	BIT_CLR_ATOMIC(GVE_NUM_STATE_FLAGS, pos, &priv->state_flags);
 }
 
 /* Defined in gve_main.c */
@@ -391,17 +404,10 @@ void gve_schedule_reset(struct gve_priv *priv);
 
 /* Register access functions defined in gve_utils.c */
 uint32_t gve_reg_bar_read_4(struct gve_priv *priv, bus_size_t offset);
-uint64_t gve_reg_bar_read_8(struct gve_priv *priv, bus_size_t offset);
 void gve_reg_bar_write_4(struct gve_priv *priv, bus_size_t offset, uint32_t val);
-void gve_reg_bar_write_8(struct gve_priv *priv, bus_size_t offset, uint64_t val);
 void gve_db_bar_write_4(struct gve_priv *priv, bus_size_t offset, uint32_t val);
 
 /* QPL (Queue Page List) functions defined in gve_qpl.c */
-uint32_t gve_num_tx_qpls(struct gve_priv *priv);
-uint32_t gve_num_rx_qpls(struct gve_priv *priv);
-struct gve_queue_page_list * gve_assign_tx_qpl(struct gve_priv *priv);
-struct gve_queue_page_list * gve_assign_rx_qpl(struct gve_priv *priv);
-void gve_unassign_qpl(struct gve_priv *priv, int id);
 int gve_alloc_qpls(struct gve_priv *priv);
 void gve_free_qpls(struct gve_priv *priv);
 int gve_register_qpls(struct gve_priv *priv);
@@ -428,8 +434,11 @@ void gve_rx_cleanup_tq(void *arg, int pending);
 
 /* DMA functions defined in gve_utils.c */
 int gve_dma_alloc_coherent(struct gve_priv *priv, int size, int align,
-    struct gve_dma_handle *dma, int mapflags);
+    struct gve_dma_handle *dma);
 void gve_dma_free_coherent(struct gve_dma_handle *dma);
+int gve_dmamap_create(struct gve_priv *priv, int size, int align,
+    struct gve_dma_handle *dma);
+void gve_dmamap_destroy(struct gve_dma_handle *dma);
 
 /* IRQ functions defined in gve_utils.c */
 void gve_free_irqs(struct gve_priv *priv);

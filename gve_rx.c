@@ -59,9 +59,6 @@ gve_rx_free_ring(struct gve_priv *priv, int i)
 		gve_dma_free_coherent(&com->q_resources_mem);
 		com->q_resources = NULL;
 	}
-
-        /* Safe to call even if never assigned */
-	gve_unassign_qpl(priv, com->qpl->id);
 }
 
 static void
@@ -75,7 +72,7 @@ gve_prefill_rx_slots(struct gve_rx_ring *rx)
 		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i);
 		rx->page_info[i].page_offset = 0;
 		rx->page_info[i].page_address = com->qpl->dmas[i].cpu_addr;
-		rx->page_info[i].can_flip = true;
+		rx->page_info[i].page = com->qpl->pages[i];
 
 		dma = &com->qpl->dmas[i];
 		bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_PREREAD);
@@ -97,25 +94,19 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 
 	rx->mask = priv->rx_pages_per_qpl - 1;
 
-	com->qpl = gve_assign_rx_qpl(priv);
+	com->qpl = &priv->qpls[priv->tx_cfg.max_queues + i];
 	if (com->qpl == NULL) {
 		device_printf(priv->dev, "No QPL left for rx ring %d", i);
 		return (ENOMEM);
 	}
 
 	rx->page_info = malloc(priv->rx_desc_cnt * sizeof(*rx->page_info), M_GVE,
-			    M_WAITOK | M_ZERO);
-	if (rx->page_info == NULL) {
-		device_printf(priv->dev, "Failed to alloc page_info for rx ring %d", i);
-		err = (ENOMEM);
-		goto abort;
-	}
+	    M_WAITOK | M_ZERO);
 
 	gve_alloc_counters((counter_u64_t *)&rx->stats, NUM_RX_STATS);
 
 	err = gve_dma_alloc_coherent(priv, sizeof(struct gve_queue_resources),
-		  PAGE_SIZE, &com->q_resources_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    PAGE_SIZE, &com->q_resources_mem);
 	if (err != 0) {
 		device_printf(priv->dev, "Failed to alloc queue resources for rx ring %d", i);
 		goto abort;
@@ -123,9 +114,8 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 	com->q_resources = com->q_resources_mem.cpu_addr;
 
 	err = gve_dma_alloc_coherent(priv,
-		  sizeof(struct gve_rx_desc) * priv->rx_desc_cnt,
-		  CACHE_LINE_SIZE, &rx->desc_ring_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    sizeof(struct gve_rx_desc) * priv->rx_desc_cnt,
+	    CACHE_LINE_SIZE, &rx->desc_ring_mem);
 	if (err != 0) {
 		device_printf(priv->dev, "Failed to alloc desc ring for rx ring %d", i);
 		goto abort;
@@ -133,9 +123,8 @@ gve_rx_alloc_ring(struct gve_priv *priv, int i)
 	rx->desc_ring = rx->desc_ring_mem.cpu_addr;
 
 	err = gve_dma_alloc_coherent(priv,
-		  sizeof(union gve_rx_data_slot) * priv->rx_desc_cnt,
-		  CACHE_LINE_SIZE, &rx->data_ring_mem,
-		  BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT);
+	    sizeof(union gve_rx_data_slot) * priv->rx_desc_cnt,
+	    CACHE_LINE_SIZE, &rx->data_ring_mem);
 	if (err != 0) {
 		device_printf(priv->dev, "Failed to alloc data ring for rx ring %d", i);
 		goto abort;
@@ -157,11 +146,7 @@ gve_alloc_rx_rings(struct gve_priv *priv)
 	int i;
 
 	priv->rx = malloc(sizeof(struct gve_rx_ring) * priv->rx_cfg.num_queues,
-		       M_GVE, M_NOWAIT | M_ZERO);
-	if (priv->rx == NULL) {
-		device_printf(priv->dev, "Failed to alloc rx ring array\n");
-		return (ENOMEM);
-	}
+	    M_GVE, M_WAITOK | M_ZERO);
 
 	for (i = 0; i < priv->rx_cfg.num_queues; i++) {
 		err = gve_rx_alloc_ring(priv, i);
@@ -195,14 +180,15 @@ gve_rx_clear_data_ring(struct gve_rx_ring *rx)
 	struct gve_priv *priv = rx->com.priv;
 	int i;
 
-	/* The Rx data ring has this invariant: "the networking stack is not
+	/*
+	 * The Rx data ring has this invariant: "the networking stack is not
 	 * using the buffer beginning at any page_offset". This invariant is
 	 * established initially by gve_prefill_rx_slots at alloc-time and is
 	 * maintained by the cleanup taskqueue. This invariant implies that the
 	 * ring can be considered to be fully posted with buffers at this point,
 	 * even if there are unfreed mbufs still being processed, which is why we
 	 * can fill the ring without waiting on can_flip at each slot to become true.
-	 * */
+	 */
 	for (i = 0; i < priv->rx_desc_cnt; i++) {
 		rx->data_ring[i].qpl_offset = htobe64(PAGE_SIZE * i +
 		    rx->page_info[i].page_offset);
@@ -246,7 +232,7 @@ gve_start_rx_ring(struct gve_priv *priv, int i)
 	struct gve_rx_ring *rx = &priv->rx[i];
 	struct gve_ring_com *com = &rx->com;
 
-	if ((priv->ifp->if_capenable & IFCAP_LRO) != 0) {
+	if ((if_getcapenable(priv->ifp) & IFCAP_LRO) != 0) {
 		if (tcp_lro_init(&rx->lro) != 0)
 			device_printf(priv->dev, "Failed to init lro for rx ring %d", i);
 		rx->lro.ifp = priv->ifp;
@@ -254,7 +240,7 @@ gve_start_rx_ring(struct gve_priv *priv, int i)
 
 	NET_TASK_INIT(&com->cleanup_task, 0, gve_rx_cleanup_tq, rx);
 	com->cleanup_tq = taskqueue_create_fast("gve rx", M_WAITOK,
-			      taskqueue_thread_enqueue, &com->cleanup_tq);
+	    taskqueue_thread_enqueue, &com->cleanup_tq);
 
 	taskqueue_start_threads(&com->cleanup_tq, 1, PI_NET,
 	    "%s rxq %d", device_get_nameunit(priv->dev), i);
@@ -343,7 +329,7 @@ gve_rx_intr(void *arg)
 	struct gve_priv *priv = rx->com.priv;
 	struct gve_ring_com *com = &rx->com;
 
-	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+	if (__predict_false((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
 		return (FILTER_STRAY);
 
 	gve_db_bar_write_4(priv, com->irq_db_offset, GVE_IRQ_MASK);
@@ -378,11 +364,19 @@ gve_set_rss_type(__be16 flag, struct mbuf *mbuf)
 static void
 gve_mextadd_free(struct mbuf *mbuf)
 {
-	struct gve_rx_slot_page_info *page_info;
+	vm_page_t page = (vm_page_t)mbuf->m_ext.ext_arg1;
+	vm_offset_t va = (vm_offset_t)mbuf->m_ext.ext_arg2;
 
-	page_info = (struct gve_rx_slot_page_info *)mbuf->m_ext.ext_arg1;
-	if (likely(page_info != NULL))
-		page_info->can_flip = true;
+	/*
+	 * Free the page only if this is the last ref.
+	 * The interface might no longer exist by the time
+	 * this callback is called, see gve_free_qpl.
+	 */
+	if (__predict_false(vm_page_unwire_noq(page))) {
+		pmap_qremove(va, 1);
+		kva_free(va, PAGE_SIZE);
+		vm_page_free(page);
+	}
 }
 
 static void
@@ -393,8 +387,6 @@ gve_rx_flip_buff(struct gve_rx_slot_page_info *page_info, __be64 *slot_addr)
 	*(slot_addr) ^= offset;
 }
 
-#define GVE_PKT_CONT_BIT_IS_SET(x) (GVE_RXF_PKT_CONT & x)
-
 static struct mbuf *
 gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
     struct gve_rx_slot_page_info *page_info, uint16_t len,
@@ -402,13 +394,15 @@ gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
 {
 	struct gve_rx_ctx *ctx = &rx->ctx;
 	struct mbuf *mbuf;
+	u_int ref_count;
+	bool can_flip;
 
 	uint32_t offset = page_info->page_offset + page_info->pad;
-	void *va = (char*)page_info->page_address + offset;
+	void *va = (char *)page_info->page_address + offset;
 
 	if (len <= priv->rx_copybreak && is_only_frag) {
 		mbuf = m_get2(len, M_NOWAIT, MT_DATA, M_PKTHDR);
-		if (unlikely(mbuf == NULL))
+		if (__predict_false(mbuf == NULL))
 			return (NULL);
 
 		m_copyback(mbuf, 0, len, va);
@@ -419,18 +413,35 @@ gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
 		ctx->mbuf_tail = mbuf;
 	} else {
 		struct mbuf *mbuf_tail = ctx->mbuf_tail;
+		KASSERT(len <= MCLBYTES, ("gve rx fragment bigger than cluster mbuf"));
+
+		/*
+		 * This page was created with VM_ALLOC_WIRED, thus the lowest
+		 * wire count experienced by the page until the interface is
+		 * destroyed is 1.
+		 *
+		 * We wire the page again before supplying an mbuf pointing to
+		 * it to the networking stack, so before the mbuf leaves the
+		 * driver, the wire count rises to 2.
+		 *
+		 * If it is 1 again, it necessarily means that the mbuf has been
+		 * consumed and it was gve_mextadd_free that brought down the wire
+		 * count back to 1. We only need to eventually observe the 1.
+		 */
+		ref_count = atomic_load_int(&page_info->page->ref_count);
+		can_flip = VPRC_WIRE_COUNT(ref_count) == 1;
 
 		if (mbuf_tail == NULL) {
-			if (page_info->can_flip)
-				MGETHDR(mbuf, M_NOWAIT, MT_DATA);
+			if (can_flip)
+				mbuf = m_gethdr(M_NOWAIT, MT_DATA);
 			else
 				mbuf = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 
 			ctx->mbuf_head = mbuf;
 			ctx->mbuf_tail = mbuf;
 		} else {
-			if (page_info->can_flip)
-				MGET(mbuf, M_NOWAIT, MT_DATA);
+			if (can_flip)
+				mbuf = m_get(M_NOWAIT, MT_DATA);
 			else
 				mbuf = m_getcl(M_NOWAIT, MT_DATA, 0);
 
@@ -438,18 +449,24 @@ gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
 			ctx->mbuf_tail = mbuf;
 		}
 
-		if (unlikely(mbuf == NULL))
+		if (__predict_false(mbuf == NULL))
 			return (NULL);
 
-		if (page_info->can_flip) {
+		if (can_flip) {
 			MEXTADD(mbuf, va, len, gve_mextadd_free,
-			    page_info, NULL, 0, EXT_NET_DRV);
+			    page_info->page, page_info->page_address,
+			    0, EXT_NET_DRV);
 
 			counter_enter();
 			counter_u64_add_protected(rx->stats.rx_frag_flip_cnt, 1);
 			counter_exit();
 
-			page_info->can_flip = false;
+			/*
+			 * Grab an extra ref to the page so that gve_mextadd_free
+			 * does not end up freeing the page while the interface exists.
+			 */
+			vm_page_wire(page_info->page);
+
 			gve_rx_flip_buff(page_info, &data_slot->qpl_offset);
 		} else {
 			m_copyback(mbuf, 0, len, va);
@@ -463,6 +480,16 @@ gve_rx_create_mbuf(struct gve_priv *priv, struct gve_rx_ring *rx,
 	ctx->total_size += len;
 
 	return (mbuf);
+}
+
+static inline bool
+gve_needs_rss(__be16 flag)
+{
+	if ((flag & GVE_RXF_FRAG) != 0)
+		return (false);
+	if ((flag & (GVE_RXF_IPV4 | GVE_RXF_IPV6)) != 0)
+		return (true);
+	return (false);
 }
 
 static void
@@ -479,10 +506,10 @@ gve_rx(struct gve_priv *priv, struct gve_rx_ring *rx, struct gve_rx_desc *desc,
 	uint16_t len;
 
 	bool is_first_frag = ctx->frag_cnt == 0;
-	bool is_last_frag = !GVE_PKT_CONT_BIT_IS_SET(desc->flags_seq);
+	bool is_last_frag = !(GVE_RXF_PKT_CONT & desc->flags_seq);
 	bool is_only_frag = is_first_frag && is_last_frag;
 
-	if (unlikely(ctx->drop_pkt))
+	if (__predict_false(ctx->drop_pkt))
 		goto finish_frag;
 
 	if ((desc->flags_seq & GVE_RXF_ERR) != 0) {
@@ -506,7 +533,7 @@ gve_rx(struct gve_priv *priv, struct gve_rx_ring *rx, struct gve_rx_desc *desc,
 	    BUS_DMASYNC_POSTREAD);
 
 	mbuf = gve_rx_create_mbuf(priv, rx, page_info, len, data_slot,
-	           is_only_frag);
+	    is_only_frag);
 	if (mbuf == NULL) {
 		ctx->drop_pkt = true;
 		counter_enter();
@@ -539,17 +566,15 @@ gve_rx(struct gve_priv *priv, struct gve_rx_ring *rx, struct gve_rx_desc *desc,
 		mbuf->m_pkthdr.len = ctx->total_size;
 		do_if_input = true;
 
-		if (((ifp->if_capenable & IFCAP_LRO) != 0) && /* LRO is enabled */
-		    (desc->flags_seq & GVE_RXF_TCP) &&   /* pkt is a TCP pkt */
-		    ((mbuf->m_pkthdr.csum_flags & CSUM_DATA_VALID) != 0)) { /* NIC verified csum */
-			if ((rx->lro.lro_cnt != 0) &&         /* LRO resources exist */
-			(tcp_lro_rx(&rx->lro, mbuf, 0) == 0)) {
-				do_if_input = false;
-			}
-		}
+		if (((if_getcapenable(priv->ifp) & IFCAP_LRO) != 0) &&      /* LRO is enabled */
+		    (desc->flags_seq & GVE_RXF_TCP) &&                      /* pkt is a TCP pkt */
+		    ((mbuf->m_pkthdr.csum_flags & CSUM_DATA_VALID) != 0) && /* NIC verified csum */
+		    (rx->lro.lro_cnt != 0) &&                               /* LRO resources exist */
+		    (tcp_lro_rx(&rx->lro, mbuf, 0) == 0))
+			do_if_input = false;
 
 		if (do_if_input)
-			ifp->if_input(ifp, mbuf);
+			if_input(ifp, mbuf);
 
 		counter_enter();
 		counter_u64_add_protected(rx->stats.rbytes, ctx->total_size);
@@ -576,6 +601,12 @@ gve_rx_work_pending(struct gve_rx_ring *rx)
 	flags_seq = desc->flags_seq;
 
 	return (GVE_SEQNO(flags_seq) == rx->seq_no);
+}
+
+static inline uint8_t
+gve_next_seqno(uint8_t seq)
+{
+	return ((seq + 1) == 8 ? 1 : seq + 1);
 }
 
 static void
@@ -605,7 +636,7 @@ gve_rx_cleanup(struct gve_priv *priv, struct gve_rx_ring *rx, int budget)
 	}
 
 	/* The device will only send whole packets. */
-	if (unlikely(ctx->frag_cnt)) {
+	if (__predict_false(ctx->frag_cnt)) {
 		m_freem(ctx->mbuf_head);
 		rx->ctx = (struct gve_rx_ctx){};
 		device_printf(priv->dev,
@@ -631,7 +662,7 @@ gve_rx_cleanup_tq(void *arg, int pending)
 	struct gve_rx_ring *rx = arg;
 	struct gve_priv *priv = rx->com.priv;
 
-	if (unlikely((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
+	if (__predict_false((if_getdrvflags(priv->ifp) & IFF_DRV_RUNNING) == 0))
 		return;
 
 	gve_rx_cleanup(priv, rx, /*budget=*/128);
@@ -639,10 +670,11 @@ gve_rx_cleanup_tq(void *arg, int pending)
 	gve_db_bar_write_4(priv, rx->com.irq_db_offset,
 	    GVE_IRQ_ACK | GVE_IRQ_EVENT);
 
-	/* Fragments received before this barrier MAY NOT cause the NIC to send an
+	/*
+	 * Fragments received before this barrier MAY NOT cause the NIC to send an
 	 * interrupt but they will still be handled by the enqueue below.
 	 * Fragments received after the barrier WILL trigger an interrupt.
-	 * */
+	 */
 	mb();
 
 	if (gve_rx_work_pending(rx)) {

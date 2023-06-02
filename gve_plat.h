@@ -33,6 +33,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/bitset.h>
 #include <sys/bus.h>
 #include <sys/endian.h>
 #include <sys/eventhandler.h>
@@ -64,10 +65,14 @@
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/tcp.h>
+#include <netinet/tcp_lro.h>
 #include <netinet/udp.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_extern.h>
+#include <vm/vm_kern.h>
+#include <vm/vm_page.h>
 
 #include <machine/atomic.h>
 #include <machine/bus.h>
@@ -77,36 +82,13 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
-#include <linux/bitops.h>
-#include <linux/compiler.h>
-#include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/errno.h>
-#include <linux/if_ether.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/vmalloc.h>
+typedef uint16_t __be16;
+typedef uint32_t __be32;
+typedef uint64_t __be64;
+#define BIT(nr) (1UL << (nr))
 
-#include <asm/types.h>
-#include <asm/byteorder.h>
-
-#if BYTE_ORDER == BIG_ENDIAN
-#define __BIG_ENDIAN_BITFIELD
-#elif BYTE_ORDER == LITTLE_ENDIAN
-#define __LITTLE_ENDIAN_BITFIELD
-#else
-#error "Must set BYTE_ORDER"
-#endif
-
-#define FBSD_VERSION_MAJOR __FreeBSD_version / 100000
-#define FBSD_VERSION_MINOR (__FreeBSD_version / 1000 ) - FBSD_VERSION_MAJOR * 100
-#define FBSD_VERSION_PATCH __FreeBSD_version - ((FBSD_VERSION_MAJOR * 100 + FBSD_VERSION_MINOR) * 1000)
-
-#define __packed __attribute__((__packed__))
-# define _Static_assert(expr, diagnostic) \
-    extern int (*__Static_assert_function (void)) \
-      [!!sizeof (struct { int __error_if_negative: (expr) ? 2 : -1; })]
-#define static_assert(expr, ...) _Static_assert(expr, #expr)
+#define FBSD_VERSION_MAJOR (__FreeBSD_version / 100000)
+#define FBSD_VERSION_MINOR ((__FreeBSD_version / 1000) - FBSD_VERSION_MAJOR * 100)
+#define FBSD_VERSION_PATCH (__FreeBSD_version - ((FBSD_VERSION_MAJOR * 100 + FBSD_VERSION_MINOR) * 1000))
 
 #endif  // _GVE_PLAT_FBSD_H

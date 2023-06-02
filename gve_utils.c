@@ -36,22 +36,10 @@ gve_reg_bar_read_4(struct gve_priv *priv, bus_size_t offset)
 	return (be32toh(bus_read_4(priv->reg_bar, offset)));
 }
 
-uint64_t
-gve_reg_bar_read_8(struct gve_priv *priv, bus_size_t offset)
-{
-	return (be64toh(bus_read_4(priv->reg_bar, offset)));
-}
-
 void
 gve_reg_bar_write_4(struct gve_priv *priv, bus_size_t offset, uint32_t val)
 {
 	bus_write_4(priv->reg_bar, offset, htobe32(val));
-}
-
-void
-gve_reg_bar_write_8(struct gve_priv *priv, bus_size_t offset, uint64_t val)
-{
-	bus_write_8(priv->reg_bar, offset, htobe64(val));
 }
 
 void
@@ -89,50 +77,48 @@ gve_dmamap_load_callback(void *arg, bus_dma_segment_t *segs, int nseg,
 
 int
 gve_dma_alloc_coherent(struct gve_priv *priv, int size, int align,
-    struct gve_dma_handle *dma, int mapflags)
+    struct gve_dma_handle *dma)
 {
 	int err;
 	device_t dev = priv->dev;
 
-	err = bus_dma_tag_create(bus_get_dma_tag(dev),	/* parent */
-				 align, 0,		/* alignment, bounds */
-				 BUS_SPACE_MAXADDR,	/* lowaddr */
-				 BUS_SPACE_MAXADDR,	/* highaddr */
-				 NULL, NULL,		/* filter, filterarg */
-				 size,			/* maxsize */
-				 1,			/* nsegments */
-				 size,			/* maxsegsize */
-				 BUS_DMA_ALLOCNOW,	/* flags */
-				 NULL,			/* lockfunc */
-				 NULL,			/* lockarg */
-				 &dma->tag);
+	err = bus_dma_tag_create(
+	    bus_get_dma_tag(dev),	/* parent */
+	    align, 0,			/* alignment, bounds */
+	    BUS_SPACE_MAXADDR,		/* lowaddr */
+	    BUS_SPACE_MAXADDR,		/* highaddr */
+	    NULL, NULL,			/* filter, filterarg */
+	    size,			/* maxsize */
+	    1,				/* nsegments */
+	    size,			/* maxsegsize */
+	    BUS_DMA_ALLOCNOW,		/* flags */
+	    NULL,			/* lockfunc */
+	    NULL,			/* lockarg */
+	    &dma->tag);
 	if (err != 0) {
 		device_printf(dev, "%s: bus_dma_tag_create failed: %d\n",
-			      __func__, err);
+		    __func__, err);
 		goto clear_tag;
 	}
 
-	err = bus_dmamem_alloc(dma->tag, (void**) &dma->cpu_addr,
-			       BUS_DMA_NOWAIT | BUS_DMA_COHERENT | BUS_DMA_ZERO,
-			       &dma->map);
+	err = bus_dmamem_alloc(dma->tag, (void **) &dma->cpu_addr,
+	    BUS_DMA_WAITOK | BUS_DMA_COHERENT | BUS_DMA_ZERO,
+	    &dma->map);
 	if (err != 0) {
 		device_printf(dev, "%s: bus_dmamem_alloc(%ju) failed: %d\n",
-			      __func__, (uintmax_t)size, err);
+		    __func__, (uintmax_t)size, err);
 		goto destroy_tag;
 	}
 
 	/* An address set by the callback will never be -1 */
 	dma->bus_addr = (bus_addr_t)-1;
 	err = bus_dmamap_load(dma->tag, dma->map, dma->cpu_addr, size,
-			      gve_dmamap_load_callback, &dma->bus_addr,
-			      mapflags | BUS_DMA_NOWAIT);
-	if ((err != 0) || dma->bus_addr == (bus_addr_t)-1) {
-		device_printf(dev, "%s: bus_dmamap_load failed: %d\n",
-			      __func__, err);
+	    gve_dmamap_load_callback, &dma->bus_addr, BUS_DMA_NOWAIT);
+	if (err != 0 || dma->bus_addr == (bus_addr_t)-1) {
+		device_printf(dev, "%s: bus_dmamap_load failed: %d\n", __func__, err);
 		goto free_mem;
 	}
 
-	dma->size = size;
 	return (0);
 
 free_mem:
@@ -151,6 +137,70 @@ gve_dma_free_coherent(struct gve_dma_handle *dma)
 	bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 	bus_dmamap_unload(dma->tag, dma->map);
 	bus_dmamem_free(dma->tag, dma->cpu_addr, dma->map);
+	bus_dma_tag_destroy(dma->tag);
+}
+
+int
+gve_dmamap_create(struct gve_priv *priv, int size, int align,
+    struct gve_dma_handle *dma)
+{
+	int err;
+	device_t dev = priv->dev;
+
+	err = bus_dma_tag_create(
+	    bus_get_dma_tag(dev),	/* parent */
+	    align, 0,			/* alignment, bounds */
+	    BUS_SPACE_MAXADDR,		/* lowaddr */
+	    BUS_SPACE_MAXADDR,		/* highaddr */
+	    NULL, NULL,			/* filter, filterarg */
+	    size,			/* maxsize */
+	    1,				/* nsegments */
+	    size,			/* maxsegsize */
+	    BUS_DMA_ALLOCNOW,		/* flags */
+	    NULL,			/* lockfunc */
+	    NULL,			/* lockarg */
+	    &dma->tag);
+	if (err != 0) {
+		device_printf(dev, "%s: bus_dma_tag_create failed: %d\n",
+		    __func__, err);
+		goto clear_tag;
+	}
+
+	err = bus_dmamap_create(dma->tag, BUS_DMA_COHERENT, &dma->map);
+	if (err != 0) {
+		device_printf(dev, "%s: bus_dmamap_create failed: %d\n",
+		    __func__, err);
+		goto destroy_tag;
+	}
+
+	/* An address set by the callback will never be -1 */
+	dma->bus_addr = (bus_addr_t)-1;
+	err = bus_dmamap_load(dma->tag, dma->map, dma->cpu_addr, size,
+	    gve_dmamap_load_callback, &dma->bus_addr, BUS_DMA_WAITOK);
+	if (err != 0 || dma->bus_addr == (bus_addr_t)-1) {
+		device_printf(dev, "%s: bus_dmamap_load failed: %d\n",
+		    __func__, err);
+		goto destroy_map;
+	}
+
+	return (0);
+
+destroy_map:
+	bus_dmamap_destroy(dma->tag, dma->map);
+destroy_tag:
+	bus_dma_tag_destroy(dma->tag);
+clear_tag:
+	dma->tag = NULL;
+
+	return (err);
+}
+
+void
+gve_dmamap_destroy(struct gve_dma_handle *dma)
+{
+	bus_dmamap_sync(dma->tag, dma->map, BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+	bus_dmamap_unload(dma->tag, dma->map);
+	bus_dmamap_destroy(dma->tag, dma->map);
 	bus_dma_tag_destroy(dma->tag);
 }
 
@@ -182,20 +232,20 @@ gve_free_irqs(struct gve_priv *priv)
 	for (i = 0; i < num_irqs; i++) {
 		irq = &priv->irq_tbl[i];
 		if (irq->res == NULL)
-		  continue;
+			continue;
 
 		rid = rman_get_rid(irq->res);
 
 		rc = bus_teardown_intr(priv->dev, irq->res, irq->cookie);
 		if (rc != 0)
 			device_printf(priv->dev, "Failed to teardown irq num %d\n",
-				      rid);
+			    rid);
 
 		rc = bus_release_resource(priv->dev, SYS_RES_IRQ,
-					  rid, irq->res);
+		    rid, irq->res);
 		if (rc != 0)
 			device_printf(priv->dev, "Failed to release irq num %d\n",
-				      rid);
+			    rid);
 
 		irq->res = NULL;
 		irq->cookie = NULL;
@@ -230,20 +280,16 @@ gve_alloc_irqs(struct gve_priv *priv)
 		goto abort;
 	} else if (got_nvecs != req_nvecs) {
 		device_printf(priv->dev, "Tried to acquire %d msix vectors, got only %d\n",
-			      req_nvecs, got_nvecs);
+		    req_nvecs, got_nvecs);
 		err = ENOSPC;
 		goto abort;
         }
 
-	device_printf(priv->dev, "Enabled MSIX with %d vectors\n", got_nvecs);
+	if (bootverbose)
+		device_printf(priv->dev, "Enabled MSIX with %d vectors\n", got_nvecs);
 
 	priv->irq_tbl = malloc(sizeof(struct gve_irq) * req_nvecs, M_GVE,
-			       M_NOWAIT | M_ZERO);
-	if (priv->irq_tbl == NULL) {
-		device_printf(priv->dev, "Failed to alloc irq table\n");
-		err = ENOMEM;
-		goto abort;
-	}
+	    M_WAITOK | M_ZERO);
 
 	for (i = 0; i < num_tx; i++) {
 		irq = &priv->irq_tbl[i];
@@ -252,17 +298,16 @@ gve_alloc_irqs(struct gve_priv *priv)
 		rid = i + 1;
 
 		irq->res = bus_alloc_resource_any(priv->dev, SYS_RES_IRQ,
-						  &rid, RF_ACTIVE);
+		    &rid, RF_ACTIVE);
 		if (irq->res == NULL) {
-			device_printf(priv->dev,
-				      "Failed to alloc irq %d for Tx queue %d\n",
-				      rid, i);
+			device_printf(priv->dev, "Failed to alloc irq %d for Tx queue %d\n",
+			    rid, i);
 			err = ENOMEM;
 			goto abort;
 		}
 
 		err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
-		         gve_tx_intr, NULL, &priv->tx[i], &irq->cookie);
+		    gve_tx_intr, NULL, &priv->tx[i], &irq->cookie);
 		if (err != 0) {
 			device_printf(priv->dev, "Failed to setup irq %d for Tx queue %d, "
 			    "err: %d\n", rid, i, err);
@@ -280,7 +325,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 		rid = i + j + 1;
 
 		irq->res = bus_alloc_resource_any(priv->dev, SYS_RES_IRQ,
-			       &rid, RF_ACTIVE);
+		    &rid, RF_ACTIVE);
 		if (irq->res == NULL) {
 			device_printf(priv->dev,
 			    "Failed to alloc irq %d for Rx queue %d", rid, j);
@@ -289,7 +334,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 		}
 
 		err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
-		         gve_rx_intr, NULL, &priv->rx[j], &irq->cookie);
+		    gve_rx_intr, NULL, &priv->rx[j], &irq->cookie);
 		if (err != 0) {
 			device_printf(priv->dev, "Failed to setup irq %d for Rx queue %d, "
 			    "err: %d\n", rid, j, err);
@@ -305,7 +350,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 	irq = &priv->irq_tbl[m];
 
 	irq->res = bus_alloc_resource_any(priv->dev, SYS_RES_IRQ,
-		       &rid, RF_ACTIVE);
+	    &rid, RF_ACTIVE);
 	if (irq->res == NULL) {
 		device_printf(priv->dev, "Failed to allocate irq %d for mgmnt queue\n", rid);
 		err = ENOMEM;
@@ -313,7 +358,7 @@ gve_alloc_irqs(struct gve_priv *priv)
 	}
 
 	err = bus_setup_intr(priv->dev, irq->res, INTR_TYPE_NET | INTR_MPSAFE,
-	         gve_mgmnt_intr, NULL, priv, &irq->cookie);
+	    gve_mgmnt_intr, NULL, priv, &irq->cookie);
 	if (err != 0) {
 		device_printf(priv->dev, "Failed to setup irq %d for mgmnt queue, err: %d\n",
 		    rid, err);

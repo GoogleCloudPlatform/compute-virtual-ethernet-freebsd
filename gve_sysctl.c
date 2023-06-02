@@ -73,6 +73,9 @@ gve_setup_rxq_sysctl(struct sysctl_ctx_list *ctx,
 	    &stats->rx_dropped_pkt_mbuf_alloc_fail,
 	    "Packets dropped due to failed mbuf allocation");
 	SYSCTL_ADD_U32(ctx, list, OID_AUTO,
+	    "rx_completed_desc", CTLFLAG_RD,
+	    &rxq->cnt, 0, "Number of descriptors completed");
+	SYSCTL_ADD_U32(ctx, list, OID_AUTO,
 	    "num_desc_posted", CTLFLAG_RD,
 	    &rxq->fill_cnt, rxq->fill_cnt,
 	    "Toal number of descriptors posted");
@@ -117,6 +120,10 @@ gve_setup_txq_sysctl(struct sysctl_ctx_list *ctx,
 	    "tx_dropped_pkt_nospace_bufring", CTLFLAG_RD,
 	    &stats->tx_dropped_pkt_nospace_bufring,
 	    "Packets dropped due to no space in br ring");
+	SYSCTL_ADD_COUNTER_U64(ctx, tx_list, OID_AUTO,
+	    "tx_dropped_pkt_vlan", CTLFLAG_RD,
+	    &stats->tx_dropped_pkt_vlan,
+	    "Dropped VLAN packets");
 }
 
 static void
@@ -142,7 +149,7 @@ gve_setup_adminq_stat_sysctl(struct sysctl_ctx_list *ctx,
 
 	/* Admin queue stats */
 	admin_node = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "adminq_stats",
-				     CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Admin Queue statistics");
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Admin Queue statistics");
 	admin_list = SYSCTL_CHILDREN(admin_node);
 
 	SYSCTL_ADD_U32(ctx, admin_list, OID_AUTO, "adminq_prod_cnt", CTLFLAG_RD,
@@ -192,6 +199,26 @@ gve_setup_adminq_stat_sysctl(struct sysctl_ctx_list *ctx,
 	    "adminq_verify_driver_compatibility_cnt");
 }
 
+static void
+gve_setup_main_stat_sysctl(struct sysctl_ctx_list *ctx,
+    struct sysctl_oid_list *child, struct gve_priv *priv)
+{
+	struct sysctl_oid *main_node;
+	struct sysctl_oid_list *main_list;
+
+	/* Main stats */
+	main_node = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "main_stats",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Main statistics");
+	main_list = SYSCTL_CHILDREN(main_node);
+
+	SYSCTL_ADD_U32(ctx, main_list, OID_AUTO, "interface_up_cnt", CTLFLAG_RD,
+	    &priv->interface_up_cnt, 0, "Times interface was set to up");
+	SYSCTL_ADD_U32(ctx, main_list, OID_AUTO, "interface_down_cnt", CTLFLAG_RD,
+	    &priv->interface_down_cnt, 0, "Times interface was set to down");
+	SYSCTL_ADD_U32(ctx, main_list, OID_AUTO, "reset_cnt", CTLFLAG_RD,
+	    &priv->reset_cnt, 0, "Times reset");
+}
+
 void gve_setup_sysctl(struct gve_priv *priv)
 {
 	device_t dev;
@@ -206,6 +233,7 @@ void gve_setup_sysctl(struct gve_priv *priv)
 
 	gve_setup_queue_stat_sysctl(ctx, child, priv);
 	gve_setup_adminq_stat_sysctl(ctx, child, priv);
+	gve_setup_main_stat_sysctl(ctx, child, priv);
 }
 
 void
