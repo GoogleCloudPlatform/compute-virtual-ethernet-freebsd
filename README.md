@@ -20,7 +20,7 @@ Device Class  | `0x200`  | Ethernet
 
 ### Supported Kernels
 
-FreeBSD 13
+FreeBSD 13.1 and upwards
 
 ## Features
 
@@ -40,15 +40,15 @@ gve does not yet support the following features:
 * Ability to change ring sizes
 * Ability to change RSS config from userspace
 * Hardware LRO
-* Netmap support
-* Busy polling support
+* Netmap (4) support
+* Polling (4) support
 
 ## Driver diagnostics
 
 * Per-queue stats can be viewed by running `sysctl -a | grep gve0`. Aggregated
 stats can be viewed by running `netstat -I gve0`.  
 
-* The driver logs its version at load time and this can be learnt by running
+* If bootverbose is on, the driver logs its version at load time and this can be learnt by running
 `dmesg | grep gve0`.  
 
 * The state of the driver taskqueues can be learnt by running `procstat -ta |
@@ -56,9 +56,8 @@ grep gve0`.
 
 ## Installation
 
-Since this is still an early-release, and not yet available in an official FreeBSD
-version, the driver has to installed as a module. The following instructions
-refer to the gcloud command, but many of them can also be performed on the web UI.
+The following instructions are for installing the driver as an out-of-tree module.
+They refer to the gcloud command, but many of them can also be performed on the web UI.
 
 1. Create a FreeBSD 13 instance in your project, log into it, and become root.
 
