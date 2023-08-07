@@ -31,6 +31,16 @@
 
 SOURCE_DIR="$(dirname "$0")/.."
 BUILD_DIR="build"
+INSTALL=false
+
+while getopts i name
+do
+    case ${name} in
+    i) INSTALL=true;;
+    ?) "Supply -i to install the new driver as a boot module"
+       exit 2;;
+    esac
+done
 
 pushd "${SOURCE_DIR}"
 trap "popd" EXIT
@@ -51,3 +61,8 @@ if [[ $? -eq 0 ]]; then
 fi
 
 kldload "${BUILD_DIR}/gve.ko"
+
+if [[ ${INSTALL} = true ]]; then
+  echo "Installing the new driver to /boot/modules"
+  cp "${BUILD_DIR}/gve.ko" "/boot/modules/gve.ko"
+fi
