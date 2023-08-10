@@ -41,8 +41,10 @@ TOTAL_BW_MBPS="100000"
 V6_ADDENDUM=""
 COOLDOWN_SECS="5"
 BIDI_ADDENDUM=""
+IPERF_BIN="iperf"
+SILENCE_ADDENDUM=""
 
-while getopts f:l:s:m:S6d name
+while getopts f:l:s:m:S6d3 name
 do
     case ${name} in
     s)   SERVER_IP="$OPTARG";;
@@ -50,23 +52,45 @@ do
     l)   DURATION="$OPTARG";;
     m)   DATAGRAM_SIZE="$OPTARG";;
     S)   SERVER=true;;
-    d)   BIDI_ADDENDUM=" -d ";;
     6)   V6_ADDENDUM="--ipv6_domain";;
-    ?)   printf "Usage: %s: [-S] [-d] [-s <server ip>] [-f <num flows>] [-l <test len seconds>] [-m <datagram size>]\n" $0
+    d)   BIDI_ADDENDUM=" -d ";;
+    3)   IPERF_BIN="iperf3";;
+    ?)   printf "Usage: %s: [-S] [-d] [-3] [-s <server ip>] [-f <num flows>] [-l <test len seconds>] [-m <datagram size>]\n" $0
          printf "    Supply -S to run in server mode\n"
          printf "    Supply -d to the client to run bidirectional flows\n"
+         printf "    Supply -3 to use iperf3 instead of iperf2\n"
          printf "    -s, -l, and -d are ignored if -S is supplied\n"
          exit 2;;
     esac
 done
 
-pkill iperf
+# iperf2 requires a v6 flag for both server and client
+V6_ADDENDUM_SERVER="${V6_ADDENDUM}"
+V6_ADDENDUM_CLIENT="${V6_ADDENDUM}"
+
+# iperf2's server requires some flags that are client-only in iperf3
+UDP_ADDENDUM_SERVER="-u -l ${DATAGRAM_SIZE}"
+
+# Some translations when using iperf3
+if [[ "${IPERF_BIN}" == "iperf3" ]]; then
+  if [[ "${BIDI_ADDENDUM}" != "" ]]; then
+    BIDI_ADDENDUM=" --bidir  "
+  fi
+  if [[ "${V6_ADDENDUM}" != "" ]]; then
+    V6_ADDENDUM_SERVER=""
+    V6_ADDENDUM_CLIENT="--version6"
+  fi
+  UDP_ADDENDUM_SERVER=""
+  SILENCE_ADDENDUM="-i ${DURATION}"
+fi
+
+pkill "${IPERF_BIN}"
 rm ${TMPFILE_PREFIX}*
-trap "pkill iperf" EXIT
+trap "pkill ${IPERF_BIN}" EXIT
 
 function launch_servers() {
   # kills previous iperf servers
-  pkill iperf
+  pkill "${IPERF_BIN}"
 
   if uname | grep -iq linux; then
 	  older_self="$(netstat -tulpn | grep ":${NC_PORT}" | awk '{print $7}' | cut -d/ -f1)"
@@ -80,14 +104,14 @@ function launch_servers() {
   fi
 
   echo "$(date): Sleeping for ${COOLDOWN_SECS}s for the ports to become free"
-  sleep ${COOLDOWN_SECS} # it takes time for the ports to become free again
+  sleep ${COOLDOWN_SECS}
 
   for i in $(seq 1 ${NUM_FLOWS}); do
-    echo "$(iperf -s -u -p $((START_PORT+i-1)) -l ${DATAGRAM_SIZE} ${V6_ADDENDUM} 2>&1) $(date)" > "${TMPFILE_PREFIX}_${i}" &
+    echo "$(${IPERF_BIN} -s ${UDP_ADDENDUM_SERVER} -p $((START_PORT+i-1)) ${V6_ADDENDUM_SERVER} 2>&1) $(date)" > "${TMPFILE_PREFIX}_${i}" &
   done
 
   ip_addr="$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}')"
-  echo "$(date): Launched ${NUM_FLOWS} iperf server processes, can point client at ${ip_addr}"
+  echo "$(date): Launched ${NUM_FLOWS} ${IPERF_BIN} server processes, can point client at ${ip_addr}"
 
   # Client asks the server to relaunch its iperf processes after a run.
   nc_msg=$(nc -l ${NC_PORT}) # nc blocks till client writes "relaunch"
@@ -103,12 +127,12 @@ if [[ ${SERVER} = true ]]; then
 fi
 
 for i in $(seq 1 ${NUM_FLOWS}); do
-  iperf -c ${SERVER_IP} -u -p $((START_PORT+i-1)) -t ${DURATION} -l ${DATAGRAM_SIZE} ${BIDI_ADDENDUM} ${V6_ADDENDUM} -b $((TOTAL_BW_MBPS/NUM_FLOWS))M -fm 2>&1 > "${TMPFILE_PREFIX}_${i}" &
+  ${IPERF_BIN} -c ${SERVER_IP} -u -p $((START_PORT+i-1)) -t ${DURATION} -l ${DATAGRAM_SIZE} ${BIDI_ADDENDUM} ${V6_ADDENDUM_CLIENT} ${SILENCE_ADDENDUM} -b $((TOTAL_BW_MBPS/NUM_FLOWS))M -fm 2>&1 > "${TMPFILE_PREFIX}_${i}" &
 done
-echo "$(date): Launched ${NUM_FLOWS} iperf client processes, waiting on them"
+echo "$(date): Launched ${NUM_FLOWS} ${IPERF_BIN} client processes, waiting on them"
 
 wait
-echo "$(date): iperfs concluded"
+echo "$(date): ${IPERF_BIN}s concluded"
 
 total_local_snd_xput=0
 total_remote_rcv_xput=0
@@ -119,25 +143,49 @@ remote_rcv_xput=0
 local_rcv_xput=0 # bidi only
 
 for i in $(seq 1 ${NUM_FLOWS}); do
-  # Extracts the 52.4 from this line: [  1] 0.00-10.00 sec  62.5 MBytes  52.4 Gbits/sec
-  local_snd_xput="$(sed -nr 's/\[[[:space:]]+1\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[M]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+  if [[ "${IPERF_BIN}" == "iperf" ]]; then
+    # Extracts the 52.4 from this line: [  1] 0.00-10.00 sec  62.5 MBytes  52.4 Gbits/sec
+    local_snd_xput="$(sed -nr 's/\[[[:space:]]+1\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[M]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+  else
+    # Extracts the 10000 from these kind of lines:
+    # [  5][TX-C]   0.00-10.00  sec  11.6 GBytes  10000 Mbits/sec  0.000 ms  0/1411468 (0%)  sender
+    # [  5]   0.00-10.00  sec  11.6 GBytes  10000 Mbits/sec  0.000 ms  0/1411468 (0%)  sender
+    local_snd_xput="$(sed -nr 's/\[[[:space:]]+5\](\[TX-C\])?[[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[GM]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*sender$/\2/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+  fi
 
-  # The UDP client program also prints a "Server Report" from which we extract
-  # the receiver stats. For example, we extract the 52.99 from this line:
-  # [  1] 0.00-10.00 sec  62.5 MBytes  52.99 Gbits/sec   0.001 ms 0/44586 (0%)
-  remote_rcv_xput="$(sed -nr 's/\[[[:space:]]+1\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[M]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+  if [[ "${IPERF_BIN}" == "iperf" ]]; then
+    # The UDP client program also prints a "Server Report" from which we extract
+    # the receiver stats. For example, we extract the 52.99 from this line:
+    # [  1] 0.00-10.00 sec  62.5 MBytes  52.99 Gbits/sec   0.001 ms 0/44586 (0%)
+    remote_rcv_xput="$(sed -nr 's/\[[[:space:]]+1\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[M]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+  else
+    # Extracts the 7173 from these kind of lines:
+    # [  5][TX-C]   0.00-10.00  sec  8.35 GBytes  7173 Mbits/sec  0.004 ms  398951/1411468 (28%)  receiver
+    # [  5]   0.00-10.00  sec  8.35 GBytes  7173 Mbits/sec  0.004 ms  398951/1411468 (28%)  receiver
+    remote_rcv_xput="$(sed -nr 's/\[[[:space:]]+5\](\[TX-C\])?[[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[GM]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*receiver$/\2/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+  fi
+
   if [[ "${remote_rcv_xput}" -eq "0" ]]; then
-    echo "No server report for at least one flow"
+    echo "No remote receive report for flow ${i}, ${IPERF_BIN} output:"
+    cat ${TMPFILE_PREFIX}_${i}
     exit 1
   fi
 
-  # The UDP client program also prints the local receive stats when running
-  # in bidirectional mode. For example, we extract the 52.99 from this line:
-  # [  2] 0.00-10.00 sec  62.5 MBytes  52.99 Gbits/sec   0.001 ms 0/44586 (0%)
   if [[ "${BIDI_ADDENDUM}" != "" ]]; then
-    local_rcv_xput="$(sed -nr 's/\[[[:space:]]+2\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[M]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+    if [[ "${IPERF_BIN}" == "iperf" ]]; then
+      # The UDP client program also prints the local receive stats when running
+      # in bidirectional mode. For example, we extract the 52.99 from this line:
+      # [  2] 0.00-10.00 sec  62.5 MBytes  52.99 Gbits/sec   0.001 ms 0/44586 (0%)
+      local_rcv_xput="$(sed -nr 's/\[[[:space:]]+2\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[M]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+    else
+      # Extracts the 7361 from this line:
+      # [  7][RX-C]   0.00-10.00  sec  8.57 GBytes  7361 Mbits/sec  0.003 ms  372386/1411445 (26%)  receiver
+      local_rcv_xput="$(sed -nr 's/\[[[:space:]]+7\]\[RX-C\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec[[:space:]]+[0-9.]+[[:space:]]+[GM]Bytes[[:space:]]+([0-9.]+)[[:space:]]+[M]bits\/sec[[:space:]]+[0-9.]+[[:space:]]ms.*receiver$/\1/p' ${TMPFILE_PREFIX}_${i} | awk -F. '{print $1}')"
+    fi
+
     if [[ "${local_rcv_xput}" -eq "0" ]]; then
-      echo "No local receive report for at least one flow"
+      echo "No local receive report for flow ${i}, ${IPERF_BIN} output:"
+      cat ${TMPFILE_PREFIX}_${i}
       exit 1
     fi
   fi
