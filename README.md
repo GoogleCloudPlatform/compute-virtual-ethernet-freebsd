@@ -30,6 +30,7 @@ gve supports the following features:
 * TX chesksum offload
 * TSO
 * Software LRO
+* Hardware LRO when using the DQO queue formats
 * Jumbo frames
 * RSS
 
@@ -44,6 +45,10 @@ gve does not yet support the following features:
 * Polling (4) support
 
 ## Driver diagnostics
+
+* Driver version can be read by running `sysctl hw.gve.driver_version`.
+
+* Queue format in use can be learnt by running `sysctl hw.gve.queue_format`. To make full use of NIC bandwidth on c3 and n4 shapes, this should say DQO.
 
 * Per-queue stats can be viewed by running `sysctl -a | grep gve0`. Aggregated
 stats can be viewed by running `netstat -I gve0`.  

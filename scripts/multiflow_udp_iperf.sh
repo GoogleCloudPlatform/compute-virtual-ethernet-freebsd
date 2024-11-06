@@ -44,7 +44,7 @@ BIDI_ADDENDUM=""
 IPERF_BIN="iperf"
 SILENCE_ADDENDUM=""
 
-while getopts f:l:s:m:S6d3 name
+while getopts f:l:b:s:m:S6d3 name
 do
     case ${name} in
     s)   SERVER_IP="$OPTARG";;
@@ -55,11 +55,12 @@ do
     6)   V6_ADDENDUM="--ipv6_domain";;
     d)   BIDI_ADDENDUM=" -d ";;
     3)   IPERF_BIN="iperf3";;
-    ?)   printf "Usage: %s: [-S] [-d] [-3] [-s <server ip>] [-f <num flows>] [-l <test len seconds>] [-m <datagram size>]\n" $0
+    b)   TOTAL_BW_MBPS="$OPTARG";;
+    ?)   printf "Usage: %s: [-S] [-d] [-3] [-s <server ip>] [-f <num flows>] [-l <test len seconds>] [-m <datagram size>] [-b <bandwidth in mbps>]\n" $0
          printf "    Supply -S to run in server mode\n"
          printf "    Supply -d to the client to run bidirectional flows\n"
          printf "    Supply -3 to use iperf3 instead of iperf2\n"
-         printf "    -s, -l, and -d are ignored if -S is supplied\n"
+         printf "    -s, -l, -b, and -d are ignored if -S is supplied\n"
          exit 2;;
     esac
 done
