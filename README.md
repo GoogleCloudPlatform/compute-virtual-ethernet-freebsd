@@ -30,25 +30,21 @@ gve supports the following features:
 * TX chesksum offload
 * TSO
 * Software LRO
-* Hardware LRO when using the DQO queue formats
+* Hardware LRO
 * Jumbo frames
 * RSS
+* Changing queue count
+* Changing ring size
 
 ## Limitations
 
 gve does not yet support the following features:
 
-* Ability to change ring sizes
 * Ability to change RSS config from userspace
-* Hardware LRO
 * Netmap (4) support
 * Polling (4) support
 
 ## Driver diagnostics
-
-* Driver version can be read by running `sysctl hw.gve.driver_version`.
-
-* Queue format in use can be learnt by running `sysctl hw.gve.queue_format`. To make full use of NIC bandwidth on c3 and n4 shapes, this should say DQO.
 
 * Per-queue stats can be viewed by running `sysctl -a | grep gve0`. Aggregated
 stats can be viewed by running `netstat -I gve0`.  
@@ -110,4 +106,57 @@ gcloud compute instances create ${INSTANCE_NAME?} \
 
 ```
 --network-performance-configs=total-egress-bandwidth-tier=TIER_1
+```
+
+## Sysctl Variables
+
+gve exposes the following sysctl(8) variables:
+
+* **hw.gve.driver_version**  
+The driver version. This is read-only.  
+
+* **hw.gve.queue_format**  
+The queue format in use. This is read-only.  
+
+* **hw.gve.disable_hw_lro**  
+Setting this boot-time tunable to 1 disables Large Receive Of-
+fload (LRO) in the NIC. The default value is 0, which means
+hardware LRO is enabled by default. The software LRO stack in
+the kernel is always used. This sysctl variable needs to be
+set before loading the driver, using loader.conf(5).
+
+* **dev.gve.X.num_rx_queues and dev.gve.X.num_tx_queues**  
+Run-time tunables that represent the number of currently used RX/TX queues.
+The default value is the max number of RX/TX queues the device can support. This call turns down the interface while setting up the new queues, which may potentially cause any new packets to be dropped.
+This call can fail if the system is not able to provide the driver with enough resources.
+In that situation, the driver will revert to the previous number of RX/TX queues.
+If this also fails, a device reset will be triggered.
+*Note*: sysctl nodes for queue stats remain available even if a queue is removed.  
+
+* **dev.gve.X.rx_ring_size and dev.gve.X.tx_ring_size**  
+Run-time tunables that represent the current ring size for RX/TX queues.
+The default value is set to device defaults for ring size.
+This call turns down the interface while setting up the queues with the new ring size,
+which may potentially cause any new packets to be dropped.
+This call can fail if the system is not able to provide the driver with enough resources.
+In that situation, the driver will try to revert to the previous ring size for RX/TX queues.
+If this also fails, the device will be in an unhealthy state and will need to be reloaded.
+This value must be a power of 2 and within the defined range.
+
+## Examples
+**Change the TX queue count to 4 for the gve0 interface**
+```
+sysctl dev.gve.0.num_tx_queues=4
+```
+**Change the RX queue count to 4 for the gve0 interface**
+```
+sysctl dev.gve.0.num_rx_queues=4
+```
+**Change the TX ring size to 512 for the gve0 interface**
+```
+sysctl dev.gve.0.tx_ring_size=512
+```
+**Change the RX ring size to 512 for the gve0 interface**
+```
+sysctl dev.gve.0.rx_ring_size=512
 ```
