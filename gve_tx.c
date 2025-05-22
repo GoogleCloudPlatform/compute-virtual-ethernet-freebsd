@@ -173,6 +173,8 @@ gve_tx_alloc_ring(struct gve_priv *priv, int i)
 	}
 	com->q_resources = com->q_resources_mem.cpu_addr;
 
+	tx->last_kicked = 0;
+
 	return (0);
 
 abort:
@@ -218,6 +220,7 @@ gve_tx_clear_desc_ring(struct gve_tx_ring *tx)
 	for (i = 0; i < com->priv->tx_desc_cnt; i++) {
 		tx->desc_ring[i] = (union gve_tx_desc){};
 		tx->info[i] = (struct gve_tx_buffer_state){};
+		gve_invalidate_timestamp(&tx->info[i].enqueue_time_sec);
 	}
 
 	bus_dmamap_sync(tx->desc_ring_mem.tag, tx->desc_ring_mem.map,
@@ -246,7 +249,7 @@ gve_start_tx_ring(struct gve_priv *priv, int i)
 	struct gve_tx_ring *tx = &priv->tx[i];
 	struct gve_ring_com *com = &tx->com;
 
-	atomic_store_bool(&tx->stopped, false);
+	atomic_store_8(&tx->stopped, 0);
 	if (gve_is_gqi(priv))
 		NET_TASK_INIT(&com->cleanup_task, 0, gve_tx_cleanup_tq, tx);
 	else
@@ -345,6 +348,30 @@ gve_destroy_tx_rings(struct gve_priv *priv)
 }
 
 int
+gve_check_tx_timeout_gqi(struct gve_priv *priv, struct gve_tx_ring *tx)
+{
+	struct gve_tx_buffer_state *info;
+	uint32_t pkt_idx;
+	int num_timeouts;
+
+	num_timeouts = 0;
+
+	for (pkt_idx = 0; pkt_idx < priv->tx_desc_cnt; pkt_idx++) {
+		info = &tx->info[pkt_idx];
+
+		if (!gve_timestamp_valid(&info->enqueue_time_sec))
+			continue;
+
+		if (__predict_false(
+		    gve_seconds_since(&info->enqueue_time_sec) >
+		    GVE_TX_TIMEOUT_PKT_SEC))
+			num_timeouts += 1;
+	}
+
+	return (num_timeouts);
+}
+
+int
 gve_tx_intr(void *arg)
 {
 	struct gve_tx_ring *tx = arg;
@@ -396,7 +423,10 @@ gve_tx_cleanup_tq(void *arg, int pending)
 		if (mbuf == NULL)
 			continue;
 
+		gve_invalidate_timestamp(&info->enqueue_time_sec);
+
 		info->mbuf = NULL;
+
 		counter_enter();
 		counter_u64_add_protected(tx->stats.tbytes, mbuf->m_pkthdr.len);
 		counter_u64_add_protected(tx->stats.tpackets, 1);
@@ -429,8 +459,8 @@ gve_tx_cleanup_tq(void *arg, int pending)
 		taskqueue_enqueue(tx->com.cleanup_tq, &tx->com.cleanup_task);
 	}
 
-	if (atomic_load_bool(&tx->stopped) && space_freed) {
-		atomic_store_bool(&tx->stopped, false);
+	if (atomic_load_8(&tx->stopped) && space_freed) {
+		atomic_store_8(&tx->stopped, 0);
 		taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 	}
 }
@@ -685,6 +715,8 @@ gve_xmit(struct gve_tx_ring *tx, struct mbuf *mbuf)
 	/* So that the cleanup taskqueue can free the mbuf eventually. */
 	info->mbuf = mbuf;
 
+	gve_set_timestamp(&info->enqueue_time_sec);
+
 	/*
 	 * We don't want to split the header, so if necessary, pad to the end
 	 * of the fifo and then put the header at the beginning of the fifo.
@@ -765,7 +797,7 @@ gve_xmit_retry_enobuf_mbuf(struct gve_tx_ring *tx,
 {
 	int err;
 
-	atomic_store_bool(&tx->stopped, true);
+	atomic_store_8(&tx->stopped, 1);
 
 	/*
 	 * Room made in the queue BEFORE the barrier will be seen by the
@@ -786,7 +818,7 @@ gve_xmit_retry_enobuf_mbuf(struct gve_tx_ring *tx,
 
 	err = gve_xmit_mbuf(tx, mbuf);
 	if (err == 0)
-		atomic_store_bool(&tx->stopped, false);
+		atomic_store_8(&tx->stopped, 0);
 
 	return (err);
 }
@@ -884,7 +916,7 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 	is_br_empty = drbr_empty(ifp, tx->br);
 	err = drbr_enqueue(ifp, tx->br, mbuf);
 	if (__predict_false(err != 0)) {
-		if (!atomic_load_bool(&tx->stopped))
+		if (!atomic_load_8(&tx->stopped))
 			taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 		counter_enter();
 		counter_u64_add_protected(tx->stats.tx_dropped_pkt_nospace_bufring, 1);
@@ -900,7 +932,7 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 	if (is_br_empty && (GVE_RING_TRYLOCK(tx) != 0)) {
 		gve_xmit_br(tx);
 		GVE_RING_UNLOCK(tx);
-	} else if (!atomic_load_bool(&tx->stopped))
+	} else if (!atomic_load_8(&tx->stopped))
 		taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 
 	return (0);
