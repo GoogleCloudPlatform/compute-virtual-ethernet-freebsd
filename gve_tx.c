@@ -249,7 +249,7 @@ gve_start_tx_ring(struct gve_priv *priv, int i)
 	struct gve_tx_ring *tx = &priv->tx[i];
 	struct gve_ring_com *com = &tx->com;
 
-	atomic_store_8(&tx->stopped, 0);
+	atomic_store_bool(&tx->stopped, false);
 	if (gve_is_gqi(priv))
 		NET_TASK_INIT(&com->cleanup_task, 0, gve_tx_cleanup_tq, tx);
 	else
@@ -459,8 +459,8 @@ gve_tx_cleanup_tq(void *arg, int pending)
 		taskqueue_enqueue(tx->com.cleanup_tq, &tx->com.cleanup_task);
 	}
 
-	if (atomic_load_8(&tx->stopped) && space_freed) {
-		atomic_store_8(&tx->stopped, 0);
+	if (atomic_load_bool(&tx->stopped) && space_freed) {
+		atomic_store_bool(&tx->stopped, false);
 		taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 	}
 }
@@ -797,7 +797,7 @@ gve_xmit_retry_enobuf_mbuf(struct gve_tx_ring *tx,
 {
 	int err;
 
-	atomic_store_8(&tx->stopped, 1);
+	atomic_store_bool(&tx->stopped, true);
 
 	/*
 	 * Room made in the queue BEFORE the barrier will be seen by the
@@ -818,7 +818,7 @@ gve_xmit_retry_enobuf_mbuf(struct gve_tx_ring *tx,
 
 	err = gve_xmit_mbuf(tx, mbuf);
 	if (err == 0)
-		atomic_store_8(&tx->stopped, 0);
+		atomic_store_bool(&tx->stopped, false);
 
 	return (err);
 }
@@ -916,7 +916,7 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 	is_br_empty = drbr_empty(ifp, tx->br);
 	err = drbr_enqueue(ifp, tx->br, mbuf);
 	if (__predict_false(err != 0)) {
-		if (!atomic_load_8(&tx->stopped))
+		if (!atomic_load_bool(&tx->stopped))
 			taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 		counter_enter();
 		counter_u64_add_protected(tx->stats.tx_dropped_pkt_nospace_bufring, 1);
@@ -932,7 +932,7 @@ gve_xmit_ifp(if_t ifp, struct mbuf *mbuf)
 	if (is_br_empty && (GVE_RING_TRYLOCK(tx) != 0)) {
 		gve_xmit_br(tx);
 		GVE_RING_UNLOCK(tx);
-	} else if (!atomic_load_8(&tx->stopped))
+	} else if (!atomic_load_bool(&tx->stopped))
 		taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 
 	return (0);

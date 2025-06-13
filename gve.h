@@ -419,7 +419,7 @@ struct gve_tx_ring {
 
 	struct task xmit_task;
 	struct taskqueue *xmit_tq;
-	uint8_t stopped;
+	bool stopped;
 
 	/* Accessed when writing descriptors */
 	struct buf_ring *br;

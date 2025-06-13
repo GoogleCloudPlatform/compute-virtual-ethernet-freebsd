@@ -1116,8 +1116,8 @@ gve_tx_cleanup_dqo(struct gve_priv *priv, struct gve_tx_ring *tx, int budget)
 	 * the queue.
 	 */
 	atomic_thread_fence_seq_cst();
-	if (atomic_load_8(&tx->stopped) && work_done) {
-		atomic_store_8(&tx->stopped, 0);
+	if (atomic_load_bool(&tx->stopped) && work_done) {
+		atomic_store_bool(&tx->stopped, false);
 		taskqueue_enqueue(tx->xmit_tq, &tx->xmit_task);
 	}
 
