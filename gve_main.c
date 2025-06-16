@@ -402,6 +402,7 @@ gve_set_mtu(if_t ifp, uint32_t new_mtu)
 	struct gve_priv *priv = if_getsoftc(ifp);
 	const uint32_t max_problem_range = 8227;
 	const uint32_t min_problem_range = 7822;
+	uint16_t new_rx_buf_size = gve_get_dqo_rx_buf_size(priv, new_mtu);
 	int err;
 
 	if ((new_mtu > priv->max_mtu) || (new_mtu < ETHERMIN)) {
@@ -410,7 +411,6 @@ gve_set_mtu(if_t ifp, uint32_t new_mtu)
 		return (EINVAL);
 	}
 
-	uint16_t new_rx_buf_size = gve_get_dqo_rx_buf_size(priv, new_mtu);
 	/*
 	 * When hardware LRO is enabled in DQ mode, MTUs within the range
 	 * [7822, 8227] trigger hardware issues which cause a drastic drop
